@@ -376,6 +376,24 @@ def resolve_attempt(
             raise NotFoundError(f"no attempt {attempt_id} to resolve")
 
 
+def attach_prava_session(
+    attempt_id: int,
+    *,
+    session_id: str,
+    iframe_url: str,
+    db_path: str | None = None,
+) -> None:
+    """Record the minted session on a pending attempt. The poller finds work by
+    this column, so an attempt without it is a session nobody will ever settle."""
+    with transaction(db_path) as conn:
+        cur = conn.execute(
+            "UPDATE attempts SET prava_session_id = ?, iframe_url = ? WHERE id = ?",
+            (session_id, iframe_url, attempt_id),
+        )
+        if cur.rowcount == 0:
+            raise NotFoundError(f"no attempt {attempt_id} to attach a prava session to")
+
+
 def attempts_for_payment(payment_id: str, *, db_path: str | None = None) -> list[dict[str, Any]]:
     with transaction(db_path) as conn:
         return _rows(
@@ -402,3 +420,98 @@ def recent_resolved_attempts(
                 (limit,),
             )
         )
+
+
+# --- analytics ---------------------------------------------------------------
+#
+# Every window query filters on created_ts, which is why timestamps are fixed
+# precision UTC strings: a text comparison is a chronological comparison, and
+# idx_payments_created makes it an index scan.
+
+
+def _window_clause(since: str, tenant_id: int | None, method: str | None) -> tuple[str, list[Any]]:
+    clauses = ["created_ts >= ?", "status IN ('succeeded', 'failed')"]
+    params: list[Any] = [since]
+    if tenant_id is not None:
+        clauses.append("tenant_id = ?")
+        params.append(tenant_id)
+    if method is not None:
+        clauses.append("method = ?")
+        params.append(method)
+    return " AND ".join(clauses), params
+
+
+def payments_by_mode(
+    *,
+    since: str,
+    tenant_id: int | None = None,
+    method: str | None = None,
+    db_path: str | None = None,
+) -> list[dict[str, Any]]:
+    """Volume and successes per routing mode — the uplift measurement itself."""
+    where, params = _window_clause(since, tenant_id, method)
+    with transaction(db_path) as conn:
+        return _rows(
+            conn.execute(
+                "SELECT routing_mode, COUNT(*) AS volume,"
+                " SUM(CASE WHEN status = 'succeeded' THEN 1 ELSE 0 END) AS succeeded"
+                f" FROM payments WHERE {where} GROUP BY routing_mode",
+                params,
+            )
+        )
+
+
+def payments_by_corridor(
+    *,
+    since: str,
+    tenant_id: int | None = None,
+    method: str | None = None,
+    db_path: str | None = None,
+) -> list[dict[str, Any]]:
+    where, params = _window_clause(since, tenant_id, method)
+    with transaction(db_path) as conn:
+        return _rows(
+            conn.execute(
+                "SELECT segment, routing_mode, COUNT(*) AS volume,"
+                " SUM(CASE WHEN status = 'succeeded' THEN 1 ELSE 0 END) AS succeeded"
+                f" FROM payments WHERE {where} GROUP BY segment, routing_mode"
+                " ORDER BY segment ASC",
+                params,
+            )
+        )
+
+
+def attempts_by_provider(*, since: str, db_path: str | None = None) -> list[dict[str, Any]]:
+    """Per-rail attempt counts and latency. Attempts, not payments: a cascade's
+    second try is the only place a rail's real behaviour is visible."""
+    with transaction(db_path) as conn:
+        return _rows(
+            conn.execute(
+                "SELECT provider, COUNT(*) AS attempts,"
+                " SUM(CASE WHEN status = 'succeeded' THEN 1 ELSE 0 END) AS succeeded,"
+                " AVG(latency_ms) AS avg_latency_ms"
+                " FROM attempts WHERE created_ts >= ? AND status IN ('succeeded', 'failed')"
+                " GROUP BY provider ORDER BY provider ASC",
+                (since,),
+            )
+        )
+
+
+def attempt_latencies(*, provider: str, since: str, db_path: str | None = None) -> list[int]:
+    """Raw latencies for a percentile that means something — AVG hides the tail
+    that a degrading rail shows up in first."""
+    with transaction(db_path) as conn:
+        rows = conn.execute(
+            "SELECT latency_ms FROM attempts WHERE provider = ? AND created_ts >= ?"
+            " AND status IN ('succeeded', 'failed') ORDER BY latency_ms ASC",
+            (provider, since),
+        ).fetchall()
+    return [int(row["latency_ms"]) for row in rows]
+
+
+def payment_count(*, since: str, db_path: str | None = None) -> int:
+    with transaction(db_path) as conn:
+        row = conn.execute(
+            "SELECT COUNT(*) AS n FROM payments WHERE created_ts >= ?", (since,)
+        ).fetchone()
+    return int(row["n"])

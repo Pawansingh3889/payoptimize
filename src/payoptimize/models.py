@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import enum
 import secrets
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Self
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -83,6 +83,12 @@ def utc_now_iso() -> str:
     """Every timestamp in the system. Same offset and same precision on every
     row, which is what makes `ORDER BY created_ts` and window filters correct."""
     return datetime.now(UTC).isoformat(timespec="milliseconds")
+
+
+def iso_since(seconds: float) -> str:
+    """The timestamp `seconds` ago, in the same format every row is written in —
+    which is what lets a rolling window be a plain text comparison in SQL."""
+    return (datetime.now(UTC) - timedelta(seconds=seconds)).isoformat(timespec="milliseconds")
 
 
 def new_payment_id() -> str:
