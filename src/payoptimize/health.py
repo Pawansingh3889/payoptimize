@@ -26,7 +26,14 @@ from . import store
 from .models import iso_since
 from .providers import ProviderAdapter
 
-WINDOW_SECONDS = 300
+WINDOW_SECONDS = 300  # what the tile DISPLAYS: a stable 5-minute auth rate
+# What the tile is CLASSIFIED on. These are deliberately different windows.
+# Measured during a live injection: a rail degraded to 45% kept reading
+# `healthy` for the whole demo, because ninety seconds of bad traffic barely
+# moves a five-minute average. The state is the part an operator reacts to, so
+# it watches a window short enough to react within — while the displayed rate
+# stays the stable one, because a number that jumps every poll is unreadable.
+STATE_WINDOW_SECONDS = 90
 MIN_ATTEMPTS = 8  # below this there is no opinion to have
 DOWN_BELOW = 0.15
 DEGRADED_BELOW = 0.65  # a 0.45 injection lands here; a healthy 0.80 corridor does not
@@ -65,6 +72,7 @@ class HealthMonitor:
     providers: dict[str, ProviderAdapter]
     db_path: str | None = None
     window_seconds: int = WINDOW_SECONDS
+    state_window_seconds: int = STATE_WINDOW_SECONDS
     _last: dict[str, str] = field(default_factory=dict)
 
     def snapshot(self, *, log_transitions: bool = True) -> list[dict[str, Any]]:
@@ -73,13 +81,24 @@ class HealthMonitor:
             row["provider"]: row
             for row in store.attempts_by_provider(since=since, db_path=self.db_path)
         }
+        recent = {
+            row["provider"]: row
+            for row in store.attempts_by_provider(
+                since=iso_since(self.state_window_seconds), db_path=self.db_path
+            )
+        }
         tiles = []
         for name, adapter in self.providers.items():
             row = rows.get(name)
             attempts = int(row["attempts"]) if row else 0
             succeeded = int(row["succeeded"] or 0) if row else 0
             auth_rate = succeeded / attempts if attempts else 0.0
-            state = classify(auth_rate, attempts)
+
+            # Classified on the short window, displayed on the long one.
+            fresh = recent.get(name)
+            fresh_n = int(fresh["attempts"]) if fresh else 0
+            fresh_ok = int(fresh["succeeded"] or 0) if fresh else 0
+            state = classify(fresh_ok / fresh_n if fresh_n else 0.0, fresh_n)
             latencies = (
                 store.attempt_latencies(provider=name, since=since, db_path=self.db_path)
                 if attempts
@@ -95,6 +114,7 @@ class HealthMonitor:
                     "label": "REAL · sandbox" if adapter.real else "SIMULATED",
                     "state": state,
                     "attempts": attempts,
+                    "recent_attempts": fresh_n,
                     "auth_rate": round(auth_rate, 4),
                     "p95_ms": percentile(latencies, 0.95),
                     "fee": f"{adapter.fee_bps / 100:.2f}% + {adapter.fee_fixed_cents}¢",

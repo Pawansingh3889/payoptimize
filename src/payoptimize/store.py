@@ -666,3 +666,23 @@ def pending_prava_attempts(*, db_path: str | None = None) -> list[dict[str, Any]
                 " ORDER BY a.id ASC"
             )
         )
+
+
+def tenant_volumes(*, since: str, db_path: str | None = None) -> list[dict[str, Any]]:
+    """Per-merchant volume, for the tenant strip. Names only — the dashboard is
+    a public page and an email address is not an aggregate."""
+    with transaction(db_path) as conn:
+        return _rows(
+            conn.execute(
+                "SELECT t.id, t.name, t.fee_bps, t.fee_fixed_cents,"
+                " COUNT(p.id) AS volume,"
+                " SUM(CASE WHEN p.status = 'succeeded' THEN 1 ELSE 0 END) AS succeeded,"
+                " COALESCE(SUM(CASE WHEN p.status = 'succeeded' THEN p.amount_cents END), 0)"
+                " AS authorized_cents"
+                " FROM tenants t LEFT JOIN payments p"
+                " ON p.tenant_id = t.id AND p.created_ts >= ?"
+                " GROUP BY t.id HAVING volume > 0"
+                " ORDER BY volume DESC",
+                (since,),
+            )
+        )
