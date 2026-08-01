@@ -383,3 +383,22 @@ def attempts_for_payment(payment_id: str, *, db_path: str | None = None) -> list
                 "SELECT * FROM attempts WHERE payment_id = ? ORDER BY seq ASC", (payment_id,)
             )
         )
+
+
+def recent_resolved_attempts(
+    *, limit: int = 2_000, db_path: str | None = None
+) -> list[dict[str, Any]]:
+    """The last `limit` resolved attempts, oldest first — the router's boot
+    rebuild replays these through the same decay math it uses live, so the
+    order has to be chronological. The inner query takes the newest rows; the
+    outer one puts them back in the order they happened.
+    """
+    with transaction(db_path) as conn:
+        return _rows(
+            conn.execute(
+                "SELECT * FROM (SELECT id, provider, segment, status, decline_code, created_ts"
+                " FROM attempts WHERE status IN ('succeeded', 'failed')"
+                " ORDER BY id DESC LIMIT ?) ORDER BY id ASC",
+                (limit,),
+            )
+        )
