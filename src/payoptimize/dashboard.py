@@ -562,9 +562,11 @@ def render_tenants(rows: list[dict[str, Any]]) -> str:
         volume = int(row["volume"])
         authorized = int(row["authorized_cents"] or 0)
         width = max(6, round(volume / busiest * 90))
+        fees = int(row.get("fees_cents") or 0)
         cells.append(
             f'<div class="merchant"><div class="who">{_esc(row["name"])}</div>'
             f'<div class="num">{volume} payments · ${authorized / 100:,.0f} authorized</div>'
+            f'<div class="num">${fees / 100:,.2f} in fees</div>'
             f'<div><i class="bar" style="width:{width}px"></i></div></div>'
         )
     return f'<div class="strip">{"".join(cells)}</div>'
