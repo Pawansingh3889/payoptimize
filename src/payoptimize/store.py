@@ -515,3 +515,137 @@ def payment_count(*, since: str, db_path: str | None = None) -> int:
             "SELECT COUNT(*) AS n FROM payments WHERE created_ts >= ?", (since,)
         ).fetchone()
     return int(row["n"])
+
+
+# --- provider events ---------------------------------------------------------
+
+
+def insert_provider_event(
+    provider: str, kind: str, detail: str = "", *, db_path: str | None = None
+) -> int:
+    """Injections and health transitions. These become the vertical annotations
+    on the auth-rate chart, which is what turns "the line moved" into "the line
+    moved *because* stripe_sim was degraded at 14:02:31"."""
+    with transaction(db_path) as conn:
+        cur = conn.execute(
+            "INSERT INTO provider_events (provider, kind, detail, ts) VALUES (?, ?, ?, ?)",
+            (provider, kind, detail, utc_now_iso()),
+        )
+        assert cur.lastrowid is not None
+        return int(cur.lastrowid)
+
+
+def recent_provider_events(
+    *, since: str, limit: int = 50, db_path: str | None = None
+) -> list[dict[str, Any]]:
+    with transaction(db_path) as conn:
+        return _rows(
+            conn.execute(
+                "SELECT * FROM provider_events WHERE ts >= ? ORDER BY ts ASC LIMIT ?",
+                (since, limit),
+            )
+        )
+
+
+# --- time series -------------------------------------------------------------
+
+
+def auth_rate_series(
+    *,
+    since: str,
+    bucket_seconds: int = 30,
+    method: str | None = None,
+    db_path: str | None = None,
+) -> list[dict[str, Any]]:
+    """Resolved payments bucketed by time and routing mode.
+
+    SQLite parses our ISO timestamps natively, so the bucketing is an integer
+    division in SQL rather than four thousand rows crossing into Python every
+    two seconds.
+    """
+    clauses = ["created_ts >= ?", "status IN ('succeeded', 'failed')"]
+    params: list[Any] = [bucket_seconds, bucket_seconds, since]
+    if method is not None:
+        clauses.append("method = ?")
+        params.append(method)
+    where = " AND ".join(clauses)
+    with transaction(db_path) as conn:
+        return _rows(
+            conn.execute(
+                "SELECT CAST(unixepoch(created_ts) / ? AS INTEGER) * ? AS bucket_ts,"
+                " routing_mode, COUNT(*) AS volume,"
+                " SUM(CASE WHEN status = 'succeeded' THEN 1 ELSE 0 END) AS succeeded"
+                f" FROM payments WHERE {where}"
+                " GROUP BY bucket_ts, routing_mode ORDER BY bucket_ts ASC",
+                params,
+            )
+        )
+
+
+def provider_mix_series(
+    *, since: str, bucket_seconds: int = 30, db_path: str | None = None
+) -> list[dict[str, Any]]:
+    """Where the router's FIRST attempts went, over time. Only seq=1 counts —
+    a cascade's second try is a consequence of the routing decision, not one."""
+    with transaction(db_path) as conn:
+        return _rows(
+            conn.execute(
+                "SELECT CAST(unixepoch(a.created_ts) / ? AS INTEGER) * ? AS bucket_ts,"
+                " a.provider, COUNT(*) AS attempts"
+                " FROM attempts a JOIN payments p ON p.id = a.payment_id"
+                " WHERE a.created_ts >= ? AND a.seq = 1 AND p.routing_mode = 'router'"
+                " GROUP BY bucket_ts, a.provider ORDER BY bucket_ts ASC",
+                (bucket_seconds, bucket_seconds, since),
+            )
+        )
+
+
+def recent_payments_with_attempts(
+    *, limit: int = 25, db_path: str | None = None
+) -> list[dict[str, Any]]:
+    """The dashboard feed. One query for the payments and one for all of their
+    attempts, rather than one per row."""
+    with transaction(db_path) as conn:
+        payments = _rows(
+            conn.execute(
+                "SELECT * FROM payments ORDER BY created_ts DESC, rowid DESC LIMIT ?", (limit,)
+            )
+        )
+        if not payments:
+            return []
+        placeholders = ",".join("?" * len(payments))
+        attempts = _rows(
+            conn.execute(
+                f"SELECT * FROM attempts WHERE payment_id IN ({placeholders})"
+                " ORDER BY payment_id, seq ASC",
+                [p["id"] for p in payments],
+            )
+        )
+    chains: dict[str, list[dict[str, Any]]] = {}
+    for attempt in attempts:
+        chains.setdefault(attempt["payment_id"], []).append(attempt)
+    for payment in payments:
+        payment["attempts"] = chains.get(payment["id"], [])
+    return payments
+
+
+def tenant_by_email(email: str, *, db_path: str | None = None) -> dict[str, Any] | None:
+    with transaction(db_path) as conn:
+        return _row(conn.execute("SELECT * FROM tenants WHERE email = ?", (email,)))
+
+
+def average_ticket_cents(
+    *, since: str, routing_mode: str | None = None, db_path: str | None = None
+) -> float:
+    """Mean authorized amount, for valuing recovered authorizations."""
+    clauses = ["created_ts >= ?", "status = 'succeeded'"]
+    params: list[Any] = [since]
+    if routing_mode is not None:
+        clauses.append("routing_mode = ?")
+        params.append(routing_mode)
+    with transaction(db_path) as conn:
+        row = conn.execute(
+            f"SELECT AVG(amount_cents) AS avg FROM payments WHERE {' AND '.join(clauses)}",
+            params,
+        ).fetchone()
+    return float(row["avg"] or 0.0)

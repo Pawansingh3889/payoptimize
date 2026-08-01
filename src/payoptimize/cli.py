@@ -37,9 +37,15 @@ def serve(args: argparse.Namespace) -> int:
 
     host = args.host or _bind_host()
     port = args.port or config.port()
-    print(f"payoptimize → http://{host}:{port}  (db: {config.db_path()})", file=sys.stderr)
+    tps = args.tps or config.generator_tps()
+    generator = "off" if args.no_generator else f"{tps} tx/s"
+    print(
+        f"payoptimize → http://{host}:{port}  (db: {config.db_path()}, generator: {generator})",
+        file=sys.stderr,
+    )
+    app = create_app(with_generator=not args.no_generator, generator_tps=tps)
     # One worker, always: the bandit's posteriors live in this process's memory.
-    uvicorn.run(create_app(), host=host, port=port, workers=1, log_level=args.log_level)
+    uvicorn.run(app, host=host, port=port, workers=1, log_level=args.log_level)
     return 0
 
 
@@ -75,6 +81,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_serve.add_argument("--host", default="")
     p_serve.add_argument("--port", type=int, default=0)
     p_serve.add_argument("--log-level", default="info")
+    p_serve.add_argument("--tps", type=float, default=0.0, help="generator rate")
+    p_serve.add_argument(
+        "--no-generator", action="store_true", help="serve without synthetic traffic"
+    )
     p_serve.set_defaults(func=serve)
 
     p_signup = subs.add_parser("signup", help="create a tenant and mint an API key")

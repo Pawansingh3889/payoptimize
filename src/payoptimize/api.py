@@ -11,20 +11,24 @@ well be an agent that has to decide what to do about it.
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import math
+import secrets
 from collections.abc import AsyncIterator
+from datetime import datetime
 from typing import Any
 
 from pydantic import ValidationError
 from starlette.applications import Starlette
 from starlette.exceptions import HTTPException
 from starlette.requests import Request
-from starlette.responses import JSONResponse
+from starlette.responses import HTMLResponse, JSONResponse
 from starlette.routing import Route
 
-from . import store, tenancy
+from . import config, dashboard, store, tenancy
 from .engine import Engine, RailUnavailable, to_response
+from .generator import Generator
 from .models import (
     PaymentMethod,
     PaymentRequest,
@@ -309,6 +313,208 @@ async def analytics_summary(request: Request) -> JSONResponse:
     )
 
 
+async def providers_health(request: Request) -> JSONResponse:
+    """Public, unauthenticated, and carefully labeled: this is the surface that
+    tells anyone looking which rail is real and which three are simulated."""
+    engine = _engine(request)
+    return JSONResponse({"providers": engine.health.snapshot()})
+
+
+# --- dashboard ---------------------------------------------------------------
+
+CHART_WINDOW_SECONDS = 15 * 60
+CHART_BUCKET_SECONDS = 30
+FEED_LIMIT = 18
+
+
+def _summary_for_dashboard(engine: Engine) -> dict[str, Any]:
+    """Service-wide, not per-tenant: the dashboard is a public read-only view of
+    aggregates and never renders a key, an email, or a tenant's identity."""
+    since = iso_since(CHART_WINDOW_SECONDS)
+    by_mode = {
+        row["routing_mode"]: row
+        for row in store.payments_by_mode(
+            since=since, method=PaymentMethod.CARD, db_path=engine.db_path
+        )
+    }
+    modes = {}
+    counts = {}
+    for mode in (RoutingMode.ROUTER, RoutingMode.BASELINE):
+        row = by_mode.get(mode)
+        n = int(row["volume"]) if row else 0
+        ok = int(row["succeeded"] or 0) if row else 0
+        counts[mode.value] = (ok, n)
+        modes[mode.value] = {"volume": n, "auth_rate": _rate(ok, n)}
+
+    volume = sum(n for _, n in counts.values())
+    succeeded = sum(ok for ok, _ in counts.values())
+    uplift = uplift_stat(*counts["router"], *counts["baseline"])
+
+    # "Revenue recovered" is deliberately conservative: the router arm's extra
+    # authorizations over the baseline's rate, valued at the router arm's own
+    # average ticket. Zero when the baseline is ahead — never a negative dressed
+    # up as a saving.
+    recovered_cents = 0
+    router_ok, router_n = counts["router"]
+    baseline_ok, baseline_n = counts["baseline"]
+    if router_n and baseline_n:
+        extra = router_ok - router_n * (baseline_ok / baseline_n)
+        if extra > 0:
+            avg_ticket = store.average_ticket_cents(
+                since=since, routing_mode=RoutingMode.ROUTER, db_path=engine.db_path
+            )
+            recovered_cents = int(extra * avg_ticket)
+
+    return {
+        "volume": volume,
+        "auth_rate": _rate(succeeded, volume),
+        "by_mode": modes,
+        "uplift": uplift,
+        "recovered_cents": recovered_cents,
+    }
+
+
+async def dashboard_page(request: Request) -> HTMLResponse:
+    engine = _engine(request)
+    return HTMLResponse(
+        dashboard.render_page(
+            stats=dashboard.render_stats(_summary_for_dashboard(engine)),
+            authchart=_auth_chart(engine),
+            tiles=dashboard.render_tiles(engine.health.snapshot()),
+            feed=dashboard.render_feed(
+                store.recent_payments_with_attempts(limit=FEED_LIMIT, db_path=engine.db_path)
+            ),
+        )
+    )
+
+
+def _auth_chart(engine: Engine) -> str:
+    since = iso_since(CHART_WINDOW_SECONDS)
+    series = store.auth_rate_series(
+        since=since,
+        bucket_seconds=CHART_BUCKET_SECONDS,
+        method=PaymentMethod.CARD,
+        db_path=engine.db_path,
+    )
+    events = [
+        dict(row, epoch=_epoch(str(row["ts"])))
+        for row in store.recent_provider_events(since=since, db_path=engine.db_path)
+    ]
+    return dashboard.render_auth_chart(series, events, bucket_seconds=CHART_BUCKET_SECONDS)
+
+
+def _epoch(ts: str) -> int:
+    return int(datetime.fromisoformat(ts).timestamp())
+
+
+async def fragment(request: Request) -> HTMLResponse:
+    engine = _engine(request)
+    name = request.path_params["name"]
+    if name == "stats":
+        return HTMLResponse(dashboard.render_stats(_summary_for_dashboard(engine)))
+    if name == "authchart":
+        return HTMLResponse(_auth_chart(engine))
+    if name == "tiles":
+        return HTMLResponse(dashboard.render_tiles(engine.health.snapshot()))
+    if name == "feed":
+        return HTMLResponse(
+            dashboard.render_feed(
+                store.recent_payments_with_attempts(limit=FEED_LIMIT, db_path=engine.db_path)
+            )
+        )
+    raise HTTPException(status_code=404, detail=f"no fragment {name!r}")
+
+
+# --- admin -------------------------------------------------------------------
+
+
+def _require_admin(request: Request) -> None:
+    try:
+        expected = config.admin_token()
+    except config.ConfigError as exc:  # unset token: refuse rather than allow
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    try:
+        supplied = tenancy.bearer_token(request.headers.get("authorization"))
+    except tenancy.AuthError as exc:
+        raise HTTPException(status_code=401, detail=str(exc)) from exc
+    if not secrets.compare_digest(supplied, expected):
+        raise HTTPException(status_code=403, detail="admin token rejected")
+
+
+async def admin_outage(request: Request) -> JSONResponse:
+    """The demo's lever. Degradation is the headline: the rail keeps answering
+    fast and simply says no, and because do_not_honor does not cascade, the
+    baseline eats every one of them while the router learns its way out."""
+    _require_admin(request)
+    body = await _json_body(request)
+    engine = _engine(request)
+
+    name = str(body.get("provider", ""))
+    provider = engine.providers.get(name)
+    if provider is None or not hasattr(provider, "inject"):
+        raise HTTPException(
+            status_code=404,
+            detail=f"no injectable provider {name!r} — the real rail cannot be faked",
+        )
+    mode = str(body.get("mode", ""))
+    auth_rate = body.get("auth_rate")
+    try:
+        provider.inject(mode, auth_rate=float(auth_rate) if auth_rate is not None else None)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    kind = {"outage": "outage_start", "degraded": "degraded_start", "clear": "cleared"}[mode]
+    detail = "" if auth_rate is None else f"auth_rate={auth_rate}"
+    store.insert_provider_event(name, kind, detail=detail, db_path=engine.db_path)
+    return JSONResponse({"provider": name, "mode": mode, "state": provider.state})
+
+
+async def admin_generator(request: Request) -> JSONResponse:
+    _require_admin(request)
+    body = await _json_body(request)
+    generator = getattr(request.app.state, "generator", None)
+    if generator is None:
+        raise HTTPException(status_code=503, detail="no generator is running")
+    if "tps" in body:
+        try:
+            generator.set_rate(float(body["tps"]))
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+    if "enabled" in body:
+        generator.enabled = bool(body["enabled"])
+    return JSONResponse(
+        {"tps": generator.tps, "enabled": generator.enabled, "created": generator.created}
+    )
+
+
+async def admin_state(request: Request) -> JSONResponse:
+    """Posteriors per arm, so the learning is inspectable while an injection is
+    in flight rather than only inferable from the traffic mix."""
+    _require_admin(request)
+    engine = _engine(request)
+    generator = getattr(request.app.state, "generator", None)
+    return JSONResponse(
+        {
+            "posteriors": engine.router.snapshot(),
+            "explore_count": engine.router.explore_count,
+            "unavailable": sorted(engine.health.unavailable()),
+            "replayed_attempts": getattr(request.app.state, "replayed_attempts", 0),
+            "generator": (
+                None
+                if generator is None
+                else {
+                    "tps": generator.tps,
+                    "enabled": generator.enabled,
+                    "created": generator.created,
+                }
+            ),
+            "injections": {
+                name: getattr(p, "state", "healthy") for name, p in engine.providers.items()
+            },
+        }
+    )
+
+
 # --- app ---------------------------------------------------------------------
 
 
@@ -341,6 +547,12 @@ ROUTES = [
     Route("/v1/payments", list_payments, methods=["GET"]),
     Route("/v1/payments/{payment_id}", get_payment),
     Route("/v1/analytics/summary", analytics_summary),
+    Route("/v1/providers", providers_health),
+    Route("/admin/outage", admin_outage, methods=["POST"]),
+    Route("/admin/generator", admin_generator, methods=["POST"]),
+    Route("/admin/state", admin_state),
+    Route("/", dashboard_page),
+    Route("/fragments/{name}", fragment),
 ]
 
 
@@ -349,6 +561,8 @@ def create_app(
     db_path: str | None = None,
     engine: Engine | None = None,
     latency_scale: float = 1.0,
+    with_generator: bool = False,
+    generator_tps: float | None = None,
 ) -> Starlette:
     @contextlib.asynccontextmanager
     async def lifespan(app: Starlette) -> AsyncIterator[None]:
@@ -356,7 +570,28 @@ def create_app(
         replayed = built.boot()
         app.state.engine = built
         app.state.replayed_attempts = replayed
-        yield
+        app.state.generator = None
+        tasks: list[asyncio.Task[None]] = []
+
+        if with_generator:
+            demo_tenant = tenancy.ensure_demo_tenant(db_path=built.db_path)
+            generator = Generator(
+                engine=built,
+                tenant_id=demo_tenant,
+                rng=built.rng,
+                tps=generator_tps if generator_tps is not None else config.generator_tps(),
+            )
+            app.state.generator = generator
+            tasks.append(asyncio.create_task(generator.run()))
+
+        try:
+            yield
+        finally:
+            for task in tasks:
+                task.cancel()
+            for task in tasks:
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
 
     return Starlette(
         routes=ROUTES,

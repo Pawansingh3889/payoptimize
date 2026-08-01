@@ -77,6 +77,24 @@ def authenticate(authorization: str | None, *, db_path: str | None = None) -> di
     return resolve(bearer_token(authorization), db_path=db_path)
 
 
+DEMO_TENANT_NAME = "PayOptimize Demo"
+DEMO_TENANT_EMAIL = "demo@payoptimize.local"
+
+
+def ensure_demo_tenant(*, db_path: str | None = None) -> int:
+    """The tenant the traffic generator bills to.
+
+    Find-or-create rather than create: a restart must not leave a second demo
+    tenant behind, or the dashboard's tenant strip grows a new row every deploy
+    and the fee meter splits across them.
+    """
+    existing = store.tenant_by_email(DEMO_TENANT_EMAIL, db_path=db_path)
+    if existing is not None:
+        return int(existing["id"])
+    tenant_id, _ = signup(DEMO_TENANT_NAME, DEMO_TENANT_EMAIL, db_path=db_path)
+    return tenant_id
+
+
 def revoke(raw_key: str, *, db_path: str | None = None) -> None:
     if not store.revoke_api_key_by_hash(hash_key(raw_key), db_path=db_path):
         raise AuthError("unknown or already-revoked API key")

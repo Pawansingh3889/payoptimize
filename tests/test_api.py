@@ -13,6 +13,7 @@ from collections.abc import Iterator
 import pytest
 from starlette.testclient import TestClient
 
+from payoptimize import store
 from payoptimize.api import create_app, uplift_stat
 from payoptimize.engine import Engine
 from payoptimize.models import PaymentStatus, RoutingMode
@@ -352,3 +353,96 @@ def test_a_genuine_tie_at_volume_is_not_called_measured() -> None:
     stat = uplift_stat(900, 1_000, 899, 1_000)
     assert stat["significant"] is False
     assert stat["status"] == "collecting"
+
+
+# --- admin -------------------------------------------------------------------
+
+ADMIN = {"Authorization": "Bearer test-admin"}
+
+
+@pytest.mark.parametrize(
+    "headers", [{}, {"Authorization": "Bearer wrong"}, {"Authorization": "Basic test-admin"}]
+)
+@pytest.mark.parametrize("path", ["/admin/state"])
+def test_admin_routes_are_guarded(client: TestClient, headers: dict, path: str) -> None:
+    assert client.get(path, headers=headers).status_code in (401, 403)
+
+
+def test_admin_outage_requires_the_token(client: TestClient) -> None:
+    response = client.post("/admin/outage", json={"provider": "stripe_sim", "mode": "outage"})
+    assert response.status_code == 401
+
+
+def test_injecting_degradation_changes_the_rail_and_logs_an_event(
+    client: TestClient, db: str
+) -> None:
+    response = client.post(
+        "/admin/outage",
+        json={"provider": "stripe_sim", "mode": "degraded", "auth_rate": 0.45},
+        headers=ADMIN,
+    )
+
+    assert response.status_code == 200
+    assert response.json()["state"] == "degraded"
+    events = store.recent_provider_events(since="2000-01-01T00:00:00.000+00:00", db_path=db)
+    assert [(e["provider"], e["kind"]) for e in events] == [("stripe_sim", "degraded_start")]
+
+
+def test_clear_restores_and_is_annotated(client: TestClient, db: str) -> None:
+    client.post("/admin/outage", json={"provider": "stripe_sim", "mode": "outage"}, headers=ADMIN)
+    client.post("/admin/outage", json={"provider": "stripe_sim", "mode": "clear"}, headers=ADMIN)
+
+    events = store.recent_provider_events(since="2000-01-01T00:00:00.000+00:00", db_path=db)
+    assert [e["kind"] for e in events] == ["outage_start", "cleared"]
+
+
+def test_the_real_rail_cannot_be_faked(client: TestClient) -> None:
+    """An operator must not be able to stage an outage on the one real rail —
+    that would make a labeled-REAL row on the dashboard a lie."""
+    response = client.post(
+        "/admin/outage", json={"provider": "prava", "mode": "outage"}, headers=ADMIN
+    )
+    assert response.status_code == 404
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"provider": "stripe_sim", "mode": "nonsense"},
+        {"provider": "stripe_sim", "mode": "degraded", "auth_rate": 5},
+        {"provider": "nope", "mode": "outage"},
+    ],
+)
+def test_bad_injections_are_refused(client: TestClient, payload: dict) -> None:
+    response = client.post("/admin/outage", json=payload, headers=ADMIN)
+    assert response.status_code in (404, 422)
+
+
+def test_admin_state_exposes_the_posteriors(client: TestClient, merchant: dict) -> None:
+    for _ in range(30):
+        client.post("/v1/payments", json=CARD, headers=merchant["auth"])
+
+    body = client.get("/admin/state", headers=ADMIN).json()
+
+    assert body["posteriors"]
+    row = body["posteriors"][0]
+    assert {"provider", "segment", "alpha", "beta", "mean"} <= set(row)
+    assert body["injections"]["stripe_sim"] == "healthy"
+    assert body["generator"] is None  # not started in this app
+
+
+def test_generator_admin_reports_when_none_is_running(client: TestClient) -> None:
+    response = client.post("/admin/generator", json={"tps": 5}, headers=ADMIN)
+    assert response.status_code == 503
+
+
+# --- providers ---------------------------------------------------------------
+
+
+def test_provider_health_is_public_and_labeled(client: TestClient) -> None:
+    body = client.get("/v1/providers").json()["providers"]
+
+    assert len(body) == 3
+    assert all(p["label"] == "SIMULATED" for p in body)
+    assert all(p["real"] is False for p in body)
+    assert {"name", "state", "auth_rate", "p95_ms", "fee"} <= set(body[0])
