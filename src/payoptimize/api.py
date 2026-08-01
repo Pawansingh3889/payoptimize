@@ -12,6 +12,7 @@ well be an agent that has to decide what to do about it.
 from __future__ import annotations
 
 import contextlib
+import math
 from collections.abc import AsyncIterator
 from typing import Any
 
@@ -36,6 +37,9 @@ from .models import (
 
 DEFAULT_WINDOW_SECONDS = 15 * 60
 MAX_PAGE = 200
+# Per arm, below which an uplift figure is reported but never called measured.
+# At 30/30 the 95% interval on the difference is roughly ±16 pts.
+MIN_ARM_VOLUME = 100
 
 
 def _error(message: str, status: int) -> JSONResponse:
@@ -180,6 +184,46 @@ def _rate(succeeded: float, volume: float) -> float:
     return round(succeeded / volume, 4) if volume else 0.0
 
 
+def uplift_stat(router_ok: int, router_n: int, baseline_ok: int, baseline_n: int) -> dict[str, Any]:
+    """The difference between the two arms, with its uncertainty attached.
+
+    PLAN §1.4 says uplift is measured, not claimed. A bare point estimate does
+    not honour that: at 30 payments per arm the 95% interval is about ±16 pts,
+    so an early sample will read −10 or +12 with equal ease. Showing either as
+    "the uplift" is a claim dressed as a measurement, and the number that lands
+    on stage during the first minute of a demo would be pure noise.
+
+    So the point estimate always ships alongside a Wald interval for the
+    difference of two proportions, and a status that says which of three things
+    is true: no data, still collecting, or an interval that excludes zero.
+    """
+    if not router_n or not baseline_n:
+        return {"pts": None, "ci95_pts": None, "status": "no_data", "significant": False}
+
+    router_rate = router_ok / router_n
+    baseline_rate = baseline_ok / baseline_n
+    pts = (router_rate - baseline_rate) * 100
+    standard_error = math.sqrt(
+        router_rate * (1 - router_rate) / router_n
+        + baseline_rate * (1 - baseline_rate) / baseline_n
+    )
+    margin = 1.96 * standard_error * 100
+    low, high = pts - margin, pts + margin
+
+    # Below the floor, refuse "significant" outright: with a handful of samples
+    # a run of luck can produce a zero-width interval (every payment authorized
+    # in both arms) that is confident about nothing at all.
+    enough = router_n >= MIN_ARM_VOLUME and baseline_n >= MIN_ARM_VOLUME
+    significant = enough and (low > 0 or high < 0)
+    return {
+        "pts": round(pts, 2),
+        "ci95_pts": [round(low, 2), round(high, 2)],
+        "status": "measured" if significant else "collecting",
+        "significant": significant,
+        "min_arm_volume": MIN_ARM_VOLUME,
+    }
+
+
 async def analytics_summary(request: Request) -> JSONResponse:
     """The uplift number, computed rather than asserted.
 
@@ -206,15 +250,15 @@ async def analytics_summary(request: Request) -> JSONResponse:
     succeeded = sum(int(row["succeeded"] or 0) for row in by_mode.values())
 
     modes = {}
+    counts = {}
     for mode in (RoutingMode.ROUTER, RoutingMode.BASELINE):
         row = by_mode.get(mode)
-        modes[mode.value] = {
-            "volume": int(row["volume"]) if row else 0,
-            "auth_rate": _rate(int(row["succeeded"] or 0), int(row["volume"])) if row else 0.0,
-        }
-    uplift = None
-    if modes["router"]["volume"] and modes["baseline"]["volume"]:
-        uplift = round((modes["router"]["auth_rate"] - modes["baseline"]["auth_rate"]) * 100, 2)
+        n = int(row["volume"]) if row else 0
+        ok = int(row["succeeded"] or 0) if row else 0
+        counts[mode.value] = (ok, n)
+        modes[mode.value] = {"volume": n, "auth_rate": _rate(ok, n)}
+
+    uplift = uplift_stat(*counts["router"], *counts["baseline"])
 
     providers = [
         {
@@ -253,7 +297,11 @@ async def analytics_summary(request: Request) -> JSONResponse:
             "volume": volume,
             "auth_rate": _rate(succeeded, volume),
             "avg_latency_ms": avg_latency,
-            "uplift_pts": uplift,
+            # The point estimate stays at the top level for callers that just
+            # want a number; `uplift` carries the interval that says whether
+            # the number means anything yet.
+            "uplift_pts": uplift["pts"],
+            "uplift": uplift,
             "by_mode": modes,
             "by_provider": providers,
             "by_corridor": sorted(corridors.values(), key=lambda c: c["segment"]),
