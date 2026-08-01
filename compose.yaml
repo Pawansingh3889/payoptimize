@@ -28,6 +28,13 @@ services:
     environment:
       PAYOPTIMIZE_DB: /data/payoptimize.sqlite3
       PAYOPTIMIZE_PORT: "8080"
+      # Required, and checked here rather than inside the container. The service
+      # refuses to boot without it — correctly, since /admin injects outages —
+      # but discovering that from a container that started and then died is a
+      # bad thirty seconds when this file is the fallback you reached for.
+      # Compose reads .env for interpolation, so `make setup` satisfies it.
+      PAYOPTIMIZE_ADMIN_TOKEN: ${PAYOPTIMIZE_ADMIN_TOKEN:?unset — run `make setup` to
+        generate a .env, or export it yourself}
     restart: unless-stopped
     # One replica, always. See fly.toml for why this is not a tuning knob.
     deploy:
