@@ -18,6 +18,10 @@ primary_region = "iad"
   PAYOPTIMIZE_DB = "/data/payoptimize.sqlite3"
   PAYOPTIMIZE_PORT = "8080"
   PAYOPTIMIZE_GENERATOR_TPS = "2"
+  # Not a secret, and stated out loud rather than left to a default: this is the
+  # line that decides whether a real card can be charged. The sk_test_ key and
+  # this host have to agree or the client refuses before minting anything.
+  PRAVA_API_BASE = "https://sandbox.api.prava.space"
 
 [http_service]
   internal_port = 8080
