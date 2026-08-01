@@ -97,7 +97,7 @@ def _record(db: str, provider: str, outcomes: list[bool], latency_ms: int = 100)
 
 @pytest.fixture
 def monitor(db: str) -> HealthMonitor:
-    engine = Engine.build(db_path=db, rng=random.Random(42), latency_scale=0)
+    engine = Engine.build(db_path=db, rng=random.Random(42), latency_scale=0, with_prava=False)
     engine.boot()
     return engine.health
 

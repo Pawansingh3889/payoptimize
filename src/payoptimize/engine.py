@@ -35,12 +35,27 @@ from .models import (
     RoutingMode,
     new_payment_id,
 )
-from .providers import PRAVA, ChargeRequest, ProviderAdapter, build_registry
+from .providers import PRAVA, ChargeRequest, ProviderAdapter, build_registry, prava
 from .router import REBUILD_LIMIT, Router, assign_mode
 
 
 class RailUnavailable(RuntimeError):
     """A payment asked for a rail this deployment has not configured."""
+
+
+def prava_configured() -> bool:
+    """Whether the real rail can be offered at all.
+
+    A deployment without a Prava key is a normal, working deployment — the card
+    rails do not need one. It just cannot honour method="prava", and saying so
+    with a 503 beats registering an adapter that fails on first use.
+    """
+    try:
+        prava.key_mode()
+        prava._user_identity()
+    except prava.PravaError:
+        return False
+    return True
 
 
 @dataclass
@@ -60,9 +75,14 @@ class Engine:
         db_path: str | None = None,
         rng: random.Random | None = None,
         latency_scale: float = 1.0,
+        with_prava: bool | None = None,
     ) -> Engine:
         shared_rng = rng if rng is not None else config.make_rng()
-        providers = build_registry(shared_rng, latency_scale=latency_scale)
+        providers = build_registry(
+            shared_rng,
+            latency_scale=latency_scale,
+            with_prava=prava_configured() if with_prava is None else with_prava,
+        )
         card_arms = tuple(name for name, p in providers.items() if not p.real)
         return cls(
             rng=shared_rng,

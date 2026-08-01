@@ -10,6 +10,7 @@ from __future__ import annotations
 import random
 from pathlib import Path
 
+import httpx
 import pytest
 
 
@@ -24,6 +25,30 @@ def env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     monkeypatch.setenv("PAYOPTIMIZE_ADMIN_TOKEN", "test-admin")
     monkeypatch.setenv("PAYOPTIMIZE_SEED", "42")
     return db
+
+
+@pytest.fixture(autouse=True)
+def no_network(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Make a real socket impossible, rather than merely unlikely.
+
+    The unregistrable host above stops a leak from reaching Prava, but it would
+    still fail as a DNS error somewhere confusing. This turns any un-mocked
+    request into an immediate, obvious failure naming the test that made it —
+    and guarantees the suite can never spend one of a finite number of sandbox
+    transactions, which PLAN §11 lists as the project's live risk.
+
+    Starlette's TestClient uses ASGITransport and httpx.MockTransport is its own
+    class, so neither is affected.
+    """
+
+    def deny(self: object, request: object, *args: object, **kwargs: object) -> None:
+        raise RuntimeError(
+            f"a test tried to open a real network connection to {request} — "
+            "use httpx.MockTransport via the http= seam"
+        )
+
+    monkeypatch.setattr(httpx.HTTPTransport, "handle_request", deny)
+    monkeypatch.setattr(httpx.AsyncHTTPTransport, "handle_async_request", deny)
 
 
 @pytest.fixture

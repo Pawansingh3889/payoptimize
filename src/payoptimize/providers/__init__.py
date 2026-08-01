@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import random
 
+from . import prava
 from .base import (
     INFRASTRUCTURE_DECLINES,
     SOFT_DECLINES,
@@ -21,6 +22,7 @@ from .base import (
     should_cascade,
     weighted_choice,
 )
+from .prava import PravaError, PravaProvider
 from .simulated import (
     CORRIDOR_AUTH,
     SIM_SPECS,
@@ -48,18 +50,28 @@ __all__ = [
     "AttemptOutcome",
     "ChargeRequest",
     "InjectionMode",
+    "PravaError",
+    "PravaProvider",
     "ProviderAdapter",
     "SimSpec",
     "SimState",
     "SimulatedProvider",
     "build_registry",
     "build_simulated",
+    "prava",
     "should_cascade",
     "weighted_choice",
 ]
 
 
-def build_registry(rng: random.Random, *, latency_scale: float = 1.0) -> dict[str, ProviderAdapter]:
+def build_registry(
+    rng: random.Random, *, latency_scale: float = 1.0, with_prava: bool = False
+) -> dict[str, ProviderAdapter]:
     """Every rail the service can charge, sharing one seeded RNG."""
     registry: dict[str, ProviderAdapter] = dict(build_simulated(rng, latency_scale=latency_scale))
+    # The real rail joins only when it is actually configured. Without a key the
+    # service still runs and method="prava" returns a typed 503 — far better
+    # than a REAL-badged row that silently went nowhere.
+    if with_prava:
+        registry[PRAVA] = PravaProvider()
     return registry

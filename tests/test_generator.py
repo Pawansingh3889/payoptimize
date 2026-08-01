@@ -16,7 +16,7 @@ from payoptimize.models import PaymentSource, RoutingMode
 
 @pytest.fixture
 def generator(db: str) -> Generator:
-    engine = Engine.build(db_path=db, rng=random.Random(42), latency_scale=0)
+    engine = Engine.build(db_path=db, rng=random.Random(42), latency_scale=0, with_prava=False)
     engine.boot()
     tenant_id = tenancy.ensure_demo_tenant(db_path=db)
     return Generator(engine=engine, tenant_id=tenant_id, rng=random.Random(42), tps=100)

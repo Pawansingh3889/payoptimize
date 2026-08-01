@@ -649,3 +649,20 @@ def average_ticket_cents(
             params,
         ).fetchone()
     return float(row["avg"] or 0.0)
+
+
+def pending_prava_attempts(*, db_path: str | None = None) -> list[dict[str, Any]]:
+    """Attempts holding a minted Prava session that nobody has settled yet.
+
+    Keyed on the session id being present: an attempt without one is a session
+    that was never minted, and polling it would ask Prava about nothing.
+    """
+    with transaction(db_path) as conn:
+        return _rows(
+            conn.execute(
+                "SELECT a.* FROM attempts a JOIN payments p ON p.id = a.payment_id"
+                " WHERE a.provider = 'prava' AND a.status = 'pending'"
+                " AND a.prava_session_id != '' AND p.status = 'pending_approval'"
+                " ORDER BY a.id ASC"
+            )
+        )
