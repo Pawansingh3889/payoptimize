@@ -18,11 +18,12 @@ than one uvicorn worker.
 from __future__ import annotations
 
 import random
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 import httpx
 
 from . import config, store
+from .health import HealthMonitor
 from .models import (
     AttemptStatus,
     AttemptView,
@@ -49,8 +50,8 @@ class Engine:
     rng: random.Random
     providers: dict[str, ProviderAdapter]
     router: Router
+    health: HealthMonitor
     db_path: str | None = None
-    unavailable: set[str] = field(default_factory=set)
 
     @classmethod
     def build(
@@ -67,6 +68,7 @@ class Engine:
             rng=shared_rng,
             providers=providers,
             router=Router(shared_rng, card_arms),
+            health=HealthMonitor(providers=providers, db_path=db_path),
             db_path=db_path,
         )
 
@@ -139,7 +141,7 @@ class Engine:
         decline_code = ""
         while True:
             provider = self.router.choose(
-                segment, mode=mode, exclude=tried, unavailable=self.unavailable
+                segment, mode=mode, exclude=tried, unavailable=self.health.unavailable()
             )
             attempt_id = store.insert_attempt(
                 payment_id=payment_id,
