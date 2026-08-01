@@ -38,6 +38,8 @@ from .models import (
     SignupResponse,
     iso_since,
 )
+from .pravapoller import PravaPoller
+from .providers import PRAVA
 
 DEFAULT_WINDOW_SECONDS = 15 * 60
 MAX_PAGE = 200
@@ -571,7 +573,16 @@ def create_app(
         app.state.engine = built
         app.state.replayed_attempts = replayed
         app.state.generator = None
+        app.state.prava_poller = None
         tasks: list[asyncio.Task[None]] = []
+
+        # The poller runs whenever the rail is configured. An approved payment
+        # that nobody settles hangs in Prava's `awaiting_result` forever, so
+        # this task is not optional wherever prava payments can be created.
+        if PRAVA in built.providers:
+            poller = PravaPoller(db_path=built.db_path)
+            app.state.prava_poller = poller
+            tasks.append(asyncio.create_task(poller.run()))
 
         if with_generator:
             demo_tenant = tenancy.ensure_demo_tenant(db_path=built.db_path)

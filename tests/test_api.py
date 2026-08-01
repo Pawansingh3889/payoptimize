@@ -23,7 +23,7 @@ CARD = {"amount_cents": 1250, "currency": "USD", "country": "US", "card_brand": 
 
 @pytest.fixture
 def client(db: str) -> Iterator[TestClient]:
-    engine = Engine.build(db_path=db, rng=random.Random(42), latency_scale=0)
+    engine = Engine.build(db_path=db, rng=random.Random(42), latency_scale=0, with_prava=False)
     with TestClient(create_app(engine=engine)) as client:
         client.app_engine = engine  # type: ignore[attr-defined]
         yield client
