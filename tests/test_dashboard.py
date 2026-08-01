@@ -348,3 +348,155 @@ def test_a_bands_label_and_its_tooltip_agree() -> None:
 
     assert labels and tooltips
     assert labels == tooltips
+
+
+# --- the real rail must stay visible -----------------------------------------
+
+
+def test_no_traffic_yet_is_reserved_for_rails_never_used() -> None:
+    """It was being said about a rail that had settled two real payments."""
+    never = {
+        "display_name": "Prava",
+        "real": True,
+        "state": "unknown",
+        "attempts": 0,
+        "lifetime_attempts": 0,
+        "last_attempt_ts": "",
+        "auth_rate": 0.0,
+        "p95_ms": 0,
+        "fee": "sandbox — no processing fee",
+    }
+    assert "no traffic yet" in dashboard.render_tiles([never])
+
+
+def test_a_rail_with_older_traffic_says_when_not_never() -> None:
+    from datetime import UTC, datetime, timedelta
+
+    used = {
+        "display_name": "Prava",
+        "real": True,
+        "state": "down",
+        "attempts": 0,
+        "lifetime_attempts": 2,
+        "last_attempt_ts": (datetime.now(UTC) - timedelta(minutes=41)).isoformat(
+            timespec="milliseconds"
+        ),
+        "auth_rate": 0.0,
+        "p95_ms": 0,
+        "fee": "sandbox — no processing fee",
+    }
+    html = dashboard.render_tiles([used])
+
+    assert "no traffic yet" not in html
+    assert "2 attempts" in html
+    assert "41 min ago" in html
+
+
+def test_a_broken_timestamp_says_less_rather_than_something_wrong() -> None:
+    tile = {
+        "display_name": "Prava",
+        "real": True,
+        "state": "down",
+        "attempts": 0,
+        "lifetime_attempts": 1,
+        "last_attempt_ts": "not-a-timestamp",
+        "auth_rate": 0.0,
+        "p95_ms": 0,
+        "fee": "—",
+    }
+    html = dashboard.render_tiles([tile])
+    assert "1 attempt" in html
+    assert "no traffic yet" not in html
+
+
+def test_the_real_fee_line_renders() -> None:
+    tile = {
+        "display_name": "Prava",
+        "real": True,
+        "state": "unknown",
+        "attempts": 0,
+        "lifetime_attempts": 0,
+        "last_attempt_ts": "",
+        "auth_rate": 0.0,
+        "p95_ms": 0,
+        "fee": "sandbox — no processing fee",
+    }
+    assert "no processing fee" in dashboard.render_tiles([tile])
+    assert "0.00%" not in dashboard.render_tiles([tile])
+
+
+def _payment(pid: str, method: str = "card", ts: str = "2026-08-01T21:44:18.000+00:00") -> dict:
+    return {
+        "id": pid,
+        "method": method,
+        "status": "succeeded",
+        "amount_cents": 1250,
+        "currency": "USD",
+        "segment": "US:USD:visa",
+        "routing_mode": "router",
+        "created_ts": ts,
+        "attempts": [],
+    }
+
+
+def test_a_real_row_survives_a_feed_full_of_generator_traffic() -> None:
+    """At 2 tx/s the rolling feed spans about nine seconds, so an unpinned real
+    payment is gone almost as soon as it lands."""
+    rolling = [_payment(f"pay_gen{i}") for i in range(18)]
+    real = [_payment("pay_real", method="prava")]
+
+    html = dashboard.render_feed(rolling, real)
+
+    assert html.count("badge real") == 1
+    assert "pay_real" not in html  # ids are not rendered, but the row is
+    assert 'class="pinned"' in html
+    assert "Real rail" in html
+
+
+def test_a_pinned_payment_is_not_also_listed_below() -> None:
+    real = _payment("pay_real", method="prava")
+    html = dashboard.render_feed([real, _payment("pay_gen")], [real])
+
+    assert html.count("badge real") == 1  # once, not twice
+    assert html.count("<tr class=") == 2  # body rows only; <thead> has its own
+
+
+def test_the_feed_is_unchanged_when_nothing_is_pinned() -> None:
+    html = dashboard.render_feed([_payment("pay_a")], [])
+    assert "Real rail" not in html
+    assert 'class="pinned"' not in html
+    assert "<table" in html
+
+
+def test_an_empty_feed_still_says_so() -> None:
+    assert "No payments yet" in dashboard.render_feed([], [])
+
+
+def test_the_live_feed_pins_prava_rows(db: str) -> None:
+    """End to end through the app: a prava payment plus enough card traffic to
+    push it off the rolling feed."""
+    engine = Engine.build(db_path=db, rng=random.Random(42), latency_scale=0, with_prava=False)
+    with TestClient(create_app(engine=engine)) as client:
+        body = client.post("/v1/tenants", json={"name": "A", "email": "a@a.test"}).json()
+        auth = {"Authorization": f"Bearer {body['api_key']}"}
+        store.insert_payment(
+            payment_id="pay_realone",
+            tenant_id=body["tenant_id"],
+            amount_cents=1250,
+            currency="USD",
+            country="",
+            card_brand="",
+            method="prava",
+            routing_mode="router",
+            segment=":USD:prava",
+            status="failed",
+            source="agent",
+            db_path=db,
+        )
+        for _ in range(25):
+            client.post("/v1/payments", json=CARD, headers=auth)
+
+        feed = client.get("/fragments/feed").text
+
+    assert feed.count("badge real") == 1
+    assert "Real rail" in feed

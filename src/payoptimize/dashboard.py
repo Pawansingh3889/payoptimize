@@ -15,6 +15,7 @@ series. Both themes are selected, not flipped.
 from __future__ import annotations
 
 import html
+from datetime import UTC, datetime
 from typing import Any
 
 # --- palette (validated; see module docstring) -------------------------------
@@ -100,6 +101,9 @@ tr:last-child td { border-bottom: none; }
 .ok { color: var(--good); } .no { color: var(--critical); }
 .empty { color: var(--ink-3); font-size: 13px; padding: 8px 0; }
 .scroll { overflow-x: auto; }
+tr.pinned td { background: color-mix(in srgb, var(--real) 9%, transparent); }
+tr.pinned td:first-child { box-shadow: inset 2px 0 0 var(--real); }
+.pincap { font-size: 11px; color: var(--ink-3); margin: 0 0 6px; }
 .two { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
 @media (max-width: 860px) { .two { grid-template-columns: 1fr; } }
 .strip { display: flex; flex-wrap: wrap; gap: 10px; }
@@ -320,6 +324,44 @@ def render_auth_chart(
     return legend + "".join(parts)
 
 
+def _ago(ts: str) -> str:
+    """How long ago, in words. Empty string if the timestamp is unusable — a
+    tile should degrade to saying less, never to saying something wrong."""
+    if not ts:
+        return ""
+    try:
+        seconds = (datetime.now(UTC) - datetime.fromisoformat(ts)).total_seconds()
+    except ValueError:
+        return ""
+    if seconds < 90:
+        return "just now"
+    if seconds < 3600:
+        return f"{int(seconds // 60)} min ago"
+    if seconds < 86_400:
+        return f"{int(seconds // 3600)}h ago"
+    return f"{int(seconds // 86_400)}d ago"
+
+
+def _tile_meta(tile: dict[str, Any]) -> str:
+    """What a rail has been doing.
+
+    "no traffic yet" is reserved for rails that have genuinely never been used.
+    Saying it about a rail that settled a real payment an hour ago is simply
+    false, and it is the real rail — the rarest and most important one — that
+    trips over a window sized for synthetic traffic.
+    """
+    if tile["attempts"]:
+        return (
+            f"{_pct(tile['auth_rate'])} auth · p95 {tile['p95_ms']}ms · {tile['attempts']} attempts"
+        )
+    lifetime = int(tile.get("lifetime_attempts") or 0)
+    if not lifetime:
+        return "no traffic yet"
+    ago = _ago(str(tile.get("last_attempt_ts") or ""))
+    plural = "" if lifetime == 1 else "s"
+    return f"{lifetime} attempt{plural} · last {ago}" if ago else f"{lifetime} attempt{plural}"
+
+
 def render_tiles(providers: list[dict[str, Any]]) -> str:
     if not providers:
         return '<p class="empty">No providers configured.</p>'
@@ -331,11 +373,7 @@ def render_tiles(providers: list[dict[str, Any]]) -> str:
             else '<span class="badge sim">SIMULATED</span>'
         )
         state = _esc(tile["state"])
-        meta = (
-            f"{_pct(tile['auth_rate'])} auth · p95 {tile['p95_ms']}ms · {tile['attempts']} attempts"
-            if tile["attempts"]
-            else "no traffic yet"
-        )
+        meta = _tile_meta(tile)
         cells.append(
             f'<div class="tile"><div class="name">{_esc(tile["display_name"])}{badge}</div>'
             f'<div class="meta"><span class="state s-{state}"><i class="dot"></i>'
@@ -361,27 +399,50 @@ def _chain(attempts: list[dict[str, Any]]) -> str:
     return " &rarr; ".join(steps) or "&mdash;"
 
 
-def render_feed(payments: list[dict[str, Any]]) -> str:
-    if not payments:
+def render_feed(payments: list[dict[str, Any]], pinned: list[dict[str, Any]] | None = None) -> str:
+    """The transaction feed, with real-rail rows held at the top.
+
+    At the generator's rate the rolling feed spans a few seconds, so a real
+    payment — the whole point of the product — scrolls out of sight almost as
+    soon as it lands. Pinning is not decoration: without it the most important
+    row on the page is visible for about nine seconds.
+    """
+    pinned = pinned or []
+    pinned_ids = {p["id"] for p in pinned}
+    rolling = [p for p in payments if p["id"] not in pinned_ids]
+    if not pinned and not rolling:
         return '<p class="empty">No payments yet.</p>'
     rows = []
-    for payment in payments:
-        real = payment["method"] == "prava"
-        badge = '<span class="badge real">REAL</span>' if real else ""
-        status = _esc(payment["status"])
-        css = "ok" if status == "succeeded" else "no" if status == "failed" else ""
-        rows.append(
-            f"<tr><td>{_esc(payment['created_ts'][11:19])}</td>"
-            f"<td>${payment['amount_cents'] / 100:,.2f} {_esc(payment['currency'])}{badge}</td>"
-            f"<td>{_esc(payment['segment'])}</td>"
-            f"<td>{_esc(payment['routing_mode'])}</td>"
-            f'<td class="{css}">{status}</td>'
-            f'<td class="chain">{_chain(payment.get("attempts", []))}</td></tr>'
-        )
+    for payment in pinned:
+        rows.append(_feed_row(payment, pinned=True))
+    for payment in rolling:
+        rows.append(_feed_row(payment))
+    caption = (
+        '<p class="pincap">Real rail &mdash; most recent, held here so live traffic '
+        "cannot bury it</p>"
+        if pinned
+        else ""
+    )
     return (
-        "<table><thead><tr><th>Time</th><th>Amount</th><th>Corridor</th>"
+        caption + "<table><thead><tr><th>Time</th><th>Amount</th><th>Corridor</th>"
         "<th>Mode</th><th>Status</th><th>Route</th></tr></thead>"
         f"<tbody>{''.join(rows)}</tbody></table>"
+    )
+
+
+def _feed_row(payment: dict[str, Any], *, pinned: bool = False) -> str:
+    real = payment["method"] == "prava"
+    badge = '<span class="badge real">REAL</span>' if real else ""
+    status = _esc(payment["status"])
+    css = "ok" if status == "succeeded" else "no" if status == "failed" else ""
+    return (
+        f'<tr class="{"pinned" if pinned else ""}">'
+        f"<td>{_esc(payment['created_ts'][11:19])}</td>"
+        f"<td>${payment['amount_cents'] / 100:,.2f} {_esc(payment['currency'])}{badge}</td>"
+        f"<td>{_esc(payment['segment'])}</td>"
+        f"<td>{_esc(payment['routing_mode'])}</td>"
+        f'<td class="{css}">{status}</td>'
+        f'<td class="chain">{_chain(payment.get("attempts", []))}</td></tr>'
     )
 
 

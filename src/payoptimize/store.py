@@ -497,6 +497,27 @@ def attempts_by_provider(*, since: str, db_path: str | None = None) -> list[dict
         )
 
 
+def provider_attempt_summary(*, db_path: str | None = None) -> dict[str, dict[str, Any]]:
+    """Lifetime attempts per provider, with the newest timestamp. No window.
+
+    The windowed counts answer "how is this rail doing lately". This answers
+    "has this rail ever been used", which is a different question and the one a
+    tile needs before it is entitled to say "no traffic yet".
+    """
+    with transaction(db_path) as conn:
+        rows = conn.execute(
+            "SELECT provider, COUNT(*) AS attempts, MAX(created_ts) AS last_ts"
+            " FROM attempts GROUP BY provider"
+        ).fetchall()
+    return {
+        str(row["provider"]): {
+            "attempts": int(row["attempts"]),
+            "last_ts": str(row["last_ts"] or ""),
+        }
+        for row in rows
+    }
+
+
 def attempt_latencies(*, provider: str, since: str, db_path: str | None = None) -> list[int]:
     """Raw latencies for a percentile that means something — AVG hides the tail
     that a degrading rail shows up in first."""
@@ -601,14 +622,21 @@ def provider_mix_series(
 
 
 def recent_payments_with_attempts(
-    *, limit: int = 25, db_path: str | None = None
+    *, limit: int = 25, method: str | None = None, db_path: str | None = None
 ) -> list[dict[str, Any]]:
     """The dashboard feed. One query for the payments and one for all of their
-    attempts, rather than one per row."""
+    attempts, rather than one per row.
+
+    `method` narrows to a single rail. The feed uses it to pin real-rail rows,
+    which generator volume would otherwise bury within seconds.
+    """
+    where = "WHERE method = ?" if method else ""
+    params: list[Any] = ([method] if method else []) + [limit]
     with transaction(db_path) as conn:
         payments = _rows(
             conn.execute(
-                "SELECT * FROM payments ORDER BY created_ts DESC, rowid DESC LIMIT ?", (limit,)
+                f"SELECT * FROM payments {where} ORDER BY created_ts DESC, rowid DESC LIMIT ?",
+                params,
             )
         )
         if not payments:

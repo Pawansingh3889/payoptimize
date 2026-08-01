@@ -345,6 +345,7 @@ async def providers_health(request: Request) -> JSONResponse:
 CHART_WINDOW_SECONDS = 15 * 60
 CHART_BUCKET_SECONDS = 30
 FEED_LIMIT = 18
+PINNED_REAL = 3
 
 
 def _summary_for_dashboard(engine: Engine) -> dict[str, Any]:
@@ -458,7 +459,12 @@ FRAGMENTS = {
     "corridors": _corridors,
     "tenants": _tenants,
     "feed": lambda e: dashboard.render_feed(
-        store.recent_payments_with_attempts(limit=FEED_LIMIT, db_path=e.db_path)
+        store.recent_payments_with_attempts(limit=FEED_LIMIT, db_path=e.db_path),
+        # Real-rail rows are pinned rather than left to compete with generator
+        # volume, which would bury them within seconds of landing.
+        store.recent_payments_with_attempts(
+            limit=PINNED_REAL, method=PaymentMethod.PRAVA, db_path=e.db_path
+        ),
     ),
 }
 

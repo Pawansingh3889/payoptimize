@@ -12,6 +12,9 @@ from payoptimize.health import (
     DEGRADED_BELOW,
     DOWN_BELOW,
     MIN_ATTEMPTS,
+    REAL_MIN_ATTEMPTS,
+    REAL_WINDOW_SECONDS,
+    STATE_WINDOW_SECONDS,
     HealthMonitor,
     HealthState,
     classify,
@@ -150,3 +153,73 @@ def test_transitions_are_logged_once(monitor: HealthMonitor, db: str) -> None:
     assert len(degraded) == 1
     assert degraded[0]["provider"] == "stripe_sim"
     assert "healthy" in degraded[0]["detail"]
+
+
+# --- the real rail keeps different company -----------------------------------
+
+
+def _record_prava(db: str, outcomes: list[bool]) -> None:
+    _record(db, "prava", outcomes)
+
+
+@pytest.fixture
+def monitor_with_prava(db: str) -> HealthMonitor:
+    engine = Engine.build(db_path=db, rng=random.Random(42), latency_scale=0, with_prava=True)
+    engine.boot()
+    return engine.health
+
+
+def test_the_real_rail_is_visible_on_a_handful_of_attempts(
+    monitor_with_prava: HealthMonitor, db: str
+) -> None:
+    """Two failed payments were invisible on production: the tile said "no
+    traffic yet" because a 5-minute window and an 8-attempt bar were written for
+    2 tx/s of synthetic traffic, and a human-paced rail satisfies neither."""
+    _record_prava(db, [False, False])
+
+    tiles = {t["name"]: t for t in monitor_with_prava.snapshot()}
+    prava = tiles["prava"]
+
+    assert prava["attempts"] == 2  # counted, not lost to a 5-minute window
+    assert prava["lifetime_attempts"] == 2
+    assert prava["state"] == HealthState.DOWN  # honest: it is not working
+    assert prava["last_attempt_ts"]
+
+
+def test_one_attempt_is_still_not_an_opinion(monitor_with_prava: HealthMonitor, db: str) -> None:
+    _record_prava(db, [False])
+    tiles = {t["name"]: t for t in monitor_with_prava.snapshot()}
+
+    assert tiles["prava"]["state"] == HealthState.UNKNOWN
+    assert tiles["prava"]["lifetime_attempts"] == 1  # visible, just not judged
+
+
+def test_a_working_real_rail_reads_healthy(monitor_with_prava: HealthMonitor, db: str) -> None:
+    _record_prava(db, [True, True, True])
+    tiles = {t["name"]: t for t in monitor_with_prava.snapshot()}
+
+    assert tiles["prava"]["state"] == HealthState.HEALTHY
+    assert tiles["prava"]["auth_rate"] == 1.0
+
+
+def test_the_simulated_rails_keep_their_own_thresholds(
+    monitor_with_prava: HealthMonitor, db: str
+) -> None:
+    """The 90-second state window was itself a measured fix. It must not regress
+    just because the real rail needed a longer one."""
+    assert monitor_with_prava.state_window_seconds == STATE_WINDOW_SECONDS
+    assert monitor_with_prava.real_window_seconds == REAL_WINDOW_SECONDS
+    assert REAL_MIN_ATTEMPTS < MIN_ATTEMPTS
+
+    _record(db, "stripe_sim", [False] * (MIN_ATTEMPTS - 1))
+    tiles = {t["name"]: t for t in monitor_with_prava.snapshot()}
+    # Below the sim bar, a simulated rail still has no opinion.
+    assert tiles["stripe_sim"]["state"] == HealthState.UNKNOWN
+
+
+def test_the_real_rail_fee_line_says_something(monitor_with_prava: HealthMonitor) -> None:
+    """0bps + 0c rendered as "0.00% + 0¢" reads as a bug or as "this is free"."""
+    tiles = {t["name"]: t for t in monitor_with_prava.snapshot()}
+
+    assert tiles["prava"]["fee"] == "sandbox — no processing fee"
+    assert "%" in tiles["stripe_sim"]["fee"]  # sims keep real schedules
