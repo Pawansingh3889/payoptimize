@@ -13,7 +13,7 @@ from collections.abc import Iterator
 import pytest
 from starlette.testclient import TestClient
 
-from payoptimize.api import create_app
+from payoptimize.api import create_app, uplift_stat
 from payoptimize.engine import Engine
 from payoptimize.models import PaymentStatus, RoutingMode
 
@@ -228,6 +228,11 @@ def test_analytics_summary_measures_both_arms(client: TestClient, merchant: dict
     assert body["by_mode"]["router"]["volume"] == 40
     assert body["by_mode"]["baseline"]["volume"] == 40
     assert body["uplift_pts"] is not None
+    # 40 payments per arm is not a measurement yet, and the API says so.
+    assert body["uplift"]["status"] == "collecting"
+    assert body["uplift"]["significant"] is False
+    low, high = body["uplift"]["ci95_pts"]
+    assert low <= body["uplift_pts"] <= high
     assert body["avg_latency_ms"] > 0
     assert {p["provider"] for p in body["by_provider"]} <= {
         "stripe_sim",
@@ -243,6 +248,8 @@ def test_uplift_is_none_until_both_arms_have_traffic(client: TestClient, merchan
 
     body = client.get("/v1/analytics/summary", headers=merchant["auth"]).json()
     assert body["uplift_pts"] is None
+    assert body["uplift"]["status"] == "no_data"
+    assert body["uplift"]["significant"] is False
 
 
 def test_analytics_is_scoped_to_the_calling_tenant(client: TestClient, merchant: dict) -> None:
@@ -298,3 +305,50 @@ def test_boot_rebuilds_posteriors_from_the_database(db: str) -> None:
         assert client.app.state.replayed_attempts >= 40
 
     assert second.router.snapshot() == learned
+
+
+# --- the uplift statistic ----------------------------------------------------
+
+
+def test_uplift_reports_no_data_when_an_arm_is_empty() -> None:
+    stat = uplift_stat(10, 10, 0, 0)
+    assert stat == {"pts": None, "ci95_pts": None, "status": "no_data", "significant": False}
+
+
+def test_uplift_point_estimate_is_the_difference_in_points() -> None:
+    stat = uplift_stat(950, 1_000, 850, 1_000)
+    assert stat["pts"] == pytest.approx(10.0, abs=0.01)
+
+
+def test_a_small_sample_is_never_called_measured() -> None:
+    """The failure this guards against: 30 payments an arm produced a −10 pt
+    reading during a live curl run. On stage that is the hero stat."""
+    stat = uplift_stat(26, 30, 29, 30)
+
+    assert stat["pts"] is not None  # still shown — hiding it would be its own lie
+    assert stat["status"] == "collecting"
+    assert stat["significant"] is False
+    low, high = stat["ci95_pts"]
+    assert low < 0 < high  # the interval straddles zero: no conclusion available
+
+
+def test_a_perfect_small_sample_is_still_not_significant() -> None:
+    """Every payment authorized in both arms gives a zero-width interval that
+    is confident about precisely nothing."""
+    stat = uplift_stat(5, 5, 5, 5)
+    assert stat["ci95_pts"] == [0.0, 0.0]
+    assert stat["significant"] is False
+
+
+def test_a_real_difference_at_volume_is_called_measured() -> None:
+    stat = uplift_stat(940, 1_000, 870, 1_000)
+
+    assert stat["status"] == "measured"
+    assert stat["significant"] is True
+    assert stat["ci95_pts"][0] > 0  # the whole interval is above zero
+
+
+def test_a_genuine_tie_at_volume_is_not_called_measured() -> None:
+    stat = uplift_stat(900, 1_000, 899, 1_000)
+    assert stat["significant"] is False
+    assert stat["status"] == "collecting"
