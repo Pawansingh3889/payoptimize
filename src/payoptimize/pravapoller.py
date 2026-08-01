@@ -27,7 +27,7 @@ from datetime import datetime
 import httpx
 from starlette.concurrency import run_in_threadpool
 
-from . import store
+from . import billing, store
 from .models import AttemptStatus, DeclineCode, PaymentStatus, utc_now_iso
 from .providers import PRAVA, prava
 
@@ -119,6 +119,7 @@ class PravaPoller:
             final_provider=PRAVA,
             db_path=self.db_path,
         )
+        billing.record_fee(payment_id, db_path=self.db_path)
 
     def _fail(self, attempt_id: int, payment_id: str, code: str, txn_ref_id: str = "") -> None:
         store.resolve_attempt(

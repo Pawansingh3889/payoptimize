@@ -22,7 +22,7 @@ from dataclasses import dataclass
 
 import httpx
 
-from . import config, store
+from . import billing, config, store
 from .health import HealthMonitor
 from .models import (
     AttemptStatus,
@@ -192,6 +192,9 @@ class Engine:
                     final_provider=provider,
                     db_path=self.db_path,
                 )
+                # Metered only on an authorization. A payment we failed to get
+                # through is not a service we performed.
+                billing.record_fee(payment_id, db_path=self.db_path)
                 return
             if not Router.should_retry(cascades=outcome.cascades, attempts_made=len(tried)):
                 break

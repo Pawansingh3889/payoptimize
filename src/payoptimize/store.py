@@ -686,3 +686,76 @@ def tenant_volumes(*, since: str, db_path: str | None = None) -> list[dict[str, 
                 (since,),
             )
         )
+
+
+# --- ledger ------------------------------------------------------------------
+
+
+def insert_ledger_once(
+    *,
+    tenant_id: int,
+    payment_id: str,
+    kind: str,
+    amount_cents: int,
+    currency: str,
+    db_path: str | None = None,
+) -> bool:
+    """Write a ledger line unless one already exists for this payment and kind.
+
+    The guard is in the SQL rather than in the caller. Both the cascade and the
+    Prava poller settle payments, a restart can replay either, and charging a
+    merchant twice for one payment is the worst class of bug this product could
+    ship. Returns True if a line was written.
+    """
+    with transaction(db_path) as conn:
+        cur = conn.execute(
+            "INSERT INTO ledger (tenant_id, payment_id, kind, amount_cents, currency, ts)"
+            " SELECT ?, ?, ?, ?, ?, ?"
+            " WHERE NOT EXISTS ("
+            "   SELECT 1 FROM ledger WHERE payment_id = ? AND kind = ?"
+            " )",
+            (
+                tenant_id,
+                payment_id,
+                kind,
+                amount_cents,
+                currency,
+                utc_now_iso(),
+                payment_id,
+                kind,
+            ),
+        )
+        return cur.rowcount > 0
+
+
+def ledger_entries(
+    *, tenant_id: int, limit: int = 50, db_path: str | None = None
+) -> list[dict[str, Any]]:
+    with transaction(db_path) as conn:
+        return _rows(
+            conn.execute(
+                "SELECT * FROM ledger WHERE tenant_id = ? ORDER BY id DESC LIMIT ?",
+                (tenant_id, limit),
+            )
+        )
+
+
+def ledger_totals(*, tenant_id: int, db_path: str | None = None) -> dict[str, Any]:
+    with transaction(db_path) as conn:
+        row = conn.execute(
+            "SELECT COUNT(*) AS entries, COALESCE(SUM(amount_cents), 0) AS total_cents"
+            " FROM ledger WHERE tenant_id = ?",
+            (tenant_id,),
+        ).fetchone()
+    return dict(row)
+
+
+def ledger_by_tenant(*, since: str, db_path: str | None = None) -> dict[int, int]:
+    """Fees metered per tenant in a window — the merchant strip's number."""
+    with transaction(db_path) as conn:
+        rows = conn.execute(
+            "SELECT tenant_id, COALESCE(SUM(amount_cents), 0) AS fees"
+            " FROM ledger WHERE ts >= ? GROUP BY tenant_id",
+            (since,),
+        ).fetchall()
+    return {int(row["tenant_id"]): int(row["fees"]) for row in rows}

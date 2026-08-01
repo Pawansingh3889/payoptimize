@@ -26,7 +26,7 @@ from starlette.requests import Request
 from starlette.responses import HTMLResponse, JSONResponse
 from starlette.routing import Route
 
-from . import config, dashboard, store, tenancy
+from . import billing, config, dashboard, store, tenancy
 from .engine import Engine, RailUnavailable, to_response
 from .generator import Generator
 from .models import (
@@ -128,6 +128,7 @@ async def index(request: Request) -> JSONResponse:
                 "GET /v1/payments/{id}": "one payment and its attempt chain",
                 "GET /v1/payments": "recent payments for your tenant",
                 "GET /v1/analytics/summary": "auth rate, uplift, volume by provider and corridor",
+                "GET /v1/ledger": "your fee statement — what PayOptimize charged, and why",
             },
         }
     )
@@ -184,6 +185,23 @@ async def list_payments(request: Request) -> JSONResponse:
         for row in rows
     ]
     return JSONResponse({"payments": [p.model_dump() for p in payments]})
+
+
+async def ledger(request: Request) -> JSONResponse:
+    """This merchant's fee statement. The monetization, metered rather than
+    described — a judge can check the arithmetic against their own payments."""
+    tenant = _tenant(request)
+    engine = _engine(request)
+    statement = billing.statement(int(tenant["id"]), limit=_limit(request), db_path=engine.db_path)
+    statement["pricing"] = {
+        "fee_bps": int(tenant["fee_bps"]),
+        "fee_fixed_cents": int(tenant["fee_fixed_cents"]),
+        "description": (
+            f"{int(tenant['fee_bps']) / 100:.2f}% + {int(tenant['fee_fixed_cents'])}c"
+            " per authorized payment; declines are never charged"
+        ),
+    }
+    return JSONResponse(statement)
 
 
 def _rate(succeeded: float, volume: float) -> float:
@@ -404,9 +422,13 @@ def _corridors(engine: Engine) -> str:
 
 
 def _tenants(engine: Engine) -> str:
-    return dashboard.render_tenants(
-        store.tenant_volumes(since=iso_since(CHART_WINDOW_SECONDS), db_path=engine.db_path)
-    )
+    since = iso_since(CHART_WINDOW_SECONDS)
+    fees = store.ledger_by_tenant(since=since, db_path=engine.db_path)
+    rows = [
+        dict(row, fees_cents=fees.get(int(row["id"]), 0))
+        for row in store.tenant_volumes(since=since, db_path=engine.db_path)
+    ]
+    return dashboard.render_tenants(rows)
 
 
 def _auth_chart(engine: Engine) -> str:
@@ -586,6 +608,7 @@ ROUTES = [
     Route("/v1/payments/{payment_id}", get_payment),
     Route("/v1/analytics/summary", analytics_summary),
     Route("/v1/providers", providers_health),
+    Route("/v1/ledger", ledger),
     Route("/admin/outage", admin_outage, methods=["POST"]),
     Route("/admin/generator", admin_generator, methods=["POST"]),
     Route("/admin/state", admin_state),
