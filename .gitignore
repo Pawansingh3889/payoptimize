@@ -1,0 +1,11 @@
+.env
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
+.venv/
+__pycache__/
+.ruff_cache/
+.pytest_cache/
+data/
+dist/
+build/
