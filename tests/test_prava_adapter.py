@@ -432,3 +432,65 @@ def test_one_unreachable_session_does_not_stall_the_others(engine: Engine, db: s
 
     statuses = {pid: store.get_payment(pid, db_path=db)["status"] for pid in (first, second)}
     assert sorted(statuses.values()) == ["pending_approval", "succeeded"]
+
+
+# --- card pre-selection ------------------------------------------------------
+
+
+def test_a_session_names_its_card_when_one_is_configured() -> None:
+    """Two sandbox transactions were spent discovering the account default was a
+    non-test PAN. Naming the card makes that unmisattributable."""
+    seen: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.update(json.loads(request.content))
+        return httpx.Response(201, json=SESSION)
+
+    with _client(handler) as http:
+        prava.create_session(
+            "X", "https://x.test", "US", {"price": "1.00"}, card_id="card_ABC", http=http
+        )
+
+    assert seen["card"] == {"card_id": "card_ABC"}
+
+
+def test_no_card_key_is_sent_when_none_is_configured() -> None:
+    """An empty card object would be a different request, not the same one."""
+    seen: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.update(json.loads(request.content))
+        return httpx.Response(201, json=SESSION)
+
+    with _client(handler) as http:
+        prava.create_session("X", "https://x.test", "US", {"price": "1.00"}, http=http)
+
+    assert "card" not in seen
+
+
+def test_list_cards_reads_the_enrolled_cards() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path.endswith("/v1/listCards")
+        assert dict(request.url.params)["customer_id"] == "unit-test"
+        return httpx.Response(
+            200, json={"cards": [{"card_id": "card_1", "card_last4": "7789"}], "count": 1}
+        )
+
+    with _client(handler) as http:
+        cards = prava.list_cards(http=http)
+
+    assert cards[0]["card_id"] == "card_1"
+
+
+def test_the_adapter_passes_its_configured_card(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("PRAVA_CARD_ID", "card_from_env")
+    seen: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.update(json.loads(request.content))
+        return httpx.Response(201, json=SESSION)
+
+    with _client(handler) as http:
+        asyncio.run(PravaProvider().charge(_charge(), http=http))
+
+    assert seen["card"] == {"card_id": "card_from_env"}

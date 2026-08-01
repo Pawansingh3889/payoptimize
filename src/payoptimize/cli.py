@@ -84,6 +84,59 @@ def demo_payment(args: argparse.Namespace) -> int:
     return 0 if response.status == "succeeded" else 1
 
 
+# Sandbox test PANs end in these; anything else cannot mint a Visa cryptogram.
+SANDBOX_TEST_LAST4 = {
+    "7789",
+    "7797",
+    "7805",
+    "7847",
+    "7854",
+    "7862",
+    "7870",
+    "7888",
+    "7896",
+    "7904",
+    "7912",
+}
+
+
+def prava_cards(args: argparse.Namespace) -> int:
+    """List the cards Prava will draw on, and flag any that cannot work.
+
+    Read-only — costs no sandbox transaction. Worth running before every live
+    rehearsal: a non-test card on the account fails at the Visa cryptogram step
+    with an error that names neither the card nor the reason.
+    """
+    from .providers import prava
+
+    cards = prava.list_cards()
+    if not cards:
+        print("no cards enrolled — add one at https://dashboard.prava.space/", file=sys.stderr)
+        return 1
+    usable = 0
+    for card in cards:
+        last4 = str(card.get("card_last4", ""))
+        ok = last4 in SANDBOX_TEST_LAST4
+        usable += ok
+        mark = "usable " if ok else "NOT a sandbox test card"
+        default = " (default)" if card.get("is_default") else ""
+        print(
+            f"{card.get('card_id', '?')}  •{last4}  {card.get('card_brand', '?')}"
+            f"  exp {card.get('card_exp_month')}/{card.get('card_exp_year')}"
+            f"  {card.get('status')}{default}  — {mark}"
+        )
+    if not usable:
+        print(
+            "\nNone of these can mint a Visa cryptogram in sandbox. Add a test card"
+            "\n(docs.prava.space/api-reference/test-cards, OTP 456789) or a live"
+            "\nsession will fail with FETCH_AGENTIC_CREDS_ERROR.",
+            file=sys.stderr,
+        )
+        return 1
+    print("\nSet PRAVA_CARD_ID to a usable card id to pin which card sessions use.")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="payoptimize", description=__doc__)
     subs = parser.add_subparsers(dest="command", required=True)
@@ -112,6 +165,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_pay.add_argument("--description", default="CLI demo payment")
     p_pay.add_argument("--fast", action="store_true", help="skip simulated latency")
     p_pay.set_defaults(func=demo_payment)
+
+    p_cards = subs.add_parser("prava-cards", help="list enrolled Prava cards (no transaction)")
+    p_cards.set_defaults(func=prava_cards)
 
     return parser
 

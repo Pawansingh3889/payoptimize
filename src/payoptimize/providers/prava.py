@@ -133,15 +133,49 @@ def amount_to_decimal(amount_cents: int) -> str:
     return f"{amount_cents // 100}.{amount_cents % 100:02d}"
 
 
+def list_cards(user_id: str = "", *, http: httpx.Client | None = None) -> list[dict]:
+    """GET /v1/listCards — the cards enrolled for a customer.
+
+    Read-only and free: it spends no sandbox transaction, which makes it the
+    right way to answer "which card will this session actually use?" before
+    minting anything.
+    """
+    if not user_id:
+        user_id, _ = _user_identity()
+    client = http or httpx.Client(timeout=30)
+    try:
+        resp = client.get(
+            f"{base_url()}/v1/listCards",
+            params={"customer_id": user_id},
+            headers={"Authorization": f"Bearer {_secret()}"},
+        )
+    finally:
+        if http is None:
+            client.close()
+    if resp.status_code != 200:
+        raise PravaError(f"listCards returned {resp.status_code}: {resp.text[:200]}")
+    cards: list[dict] = resp.json().get("cards") or []
+    return cards
+
+
 def create_session(
     merchant_name: str,
     merchant_url: str,
     merchant_country: str,
     product: dict,
     *,
+    card_id: str = "",
     http: httpx.Client | None = None,
 ) -> dict:
-    """POST /v1/sessions — returns {session_id, iframe_url, order_id, ...}."""
+    """POST /v1/sessions — returns {session_id, iframe_url, order_id, ...}.
+
+    `card_id` pre-selects an enrolled card. Left empty, Prava draws on the
+    account default — which is how two sandbox transactions were spent finding
+    out that the default was a real-looking PAN rather than a sandbox test card,
+    and that Visa will not mint a cryptogram for one ("Visa 400 — Fetching
+    cryptogram failed"). Naming the card makes that failure impossible to
+    misattribute again.
+    """
     user_id, user_email = _user_identity()
     if key_mode() == "live":
         # Nothing else in this codebase spends real money. Say so on the way past.
@@ -173,6 +207,8 @@ def create_session(
             }
         ],
     }
+    if card_id:
+        body["card"] = {"card_id": card_id}
     client = http or httpx.Client(timeout=30)
     try:
         resp = client.post(
@@ -307,6 +343,12 @@ MERCHANT_URL = "https://payoptimize.fly.dev"
 MERCHANT_COUNTRY = "US"
 
 
+def configured_card_id() -> str:
+    """PRAVA_CARD_ID, if the deployment names a card to spend from."""
+    _load_env()
+    return os.environ.get("PRAVA_CARD_ID", "").strip()
+
+
 @dataclass
 class PravaProvider:
     """The real rail, wearing the same contract as the simulated ones.
@@ -326,6 +368,8 @@ class PravaProvider:
     merchant_name: str = MERCHANT_NAME
     merchant_url: str = MERCHANT_URL
     merchant_country: str = MERCHANT_COUNTRY
+    # PRAVA_CARD_ID, when set. Empty means "let Prava pick the default".
+    card_id: str = ""
 
     async def charge(
         self, request: ChargeRequest, *, http: httpx.Client | None = None
@@ -343,6 +387,7 @@ class PravaProvider:
             self.merchant_url,
             self.merchant_country,
             product,
+            card_id=self.card_id or configured_card_id(),
             http=http,
         )
         return AttemptOutcome(
