@@ -3,6 +3,9 @@
 **Payment orchestration that routes every payment to the provider most likely to
 authorize it — and learns from every outcome.**
 
+**Live: [payoptimize.fly.dev](https://payoptimize.fly.dev/)** — real traffic, moving now.
+The dashboard is public and read-only; no login, nothing staged.
+
 5–15% of legitimate payments are declined. Most of those declines are not about the
 card: they are about *which provider* the payment went through, in *which corridor*, at
 *which moment*. PayOptimize sits between merchants and payment providers, routes each
@@ -61,20 +64,53 @@ This was built in a 48-hour window. We label rather than pretend:
 - Generator traffic is synthetic and labeled as such; the API and MCP paths are fully
   usable by anyone with a key.
 
+## Measured, not claimed
+
+Every number below came out of the running system, not a design document.
+
+**Routing.** Over 5 seeds × 4,000 payments on a 0.95 / 0.85 / 0.80 corridor, the router
+puts **80%** of first attempts on the best rail and beats the round-robin control by
+**+5.3 pts**. While a rail is degraded the gap widens to **+14 pts**, because
+`do_not_honor` is non-retriable by design — the control eats every one of them.
+
+**Reacting.** Degrade a rail to 45% auth and its share of router traffic falls under 10%
+within ~130 decisions (~50 s at demo throughput). Clear the injection and it is
+rediscovered in ~280 (~110 s), with no operator action.
+
+**Uplift carries its uncertainty.** A live run of 30 payments per arm once read
+`-10.0 pts`. That was noise — the 95% interval was `[-23.8, +3.8]`. So the API returns a
+Wald interval and one of three statuses (`no_data` / `collecting` / `measured`) alongside
+every uplift figure, and "measured" needs both 100 payments an arm *and* an interval
+excluding zero. A point estimate without an interval is a claim wearing a measurement's
+clothes.
+
+**Verification.** 322 tests. The suite makes a real socket impossible — both httpx
+transports raise — so it can never spend one of a finite number of Prava sandbox
+transactions.
+
 ## Monetization
 
-SaaS platform fee + basis points on every routed transaction — the fee ledger already
-meters it per tenant. The pricing story is self-funding: **we charge a slice of the
-declines we recover.**
+Fixed fee + basis points on each **authorized** payment (default 0.45% + 5¢), metered
+per tenant in a real ledger and readable at `GET /v1/ledger`. **Declines are never
+charged**: a payment we failed to get through is not a service we performed, and billing
+for it would invert the product's entire claim. The dashboard shows fees metered beside
+revenue recovered, so the pricing argument is a ratio you can read rather than a slide.
 
 ## Quickstart
 
 ```bash
-uv sync
-cp .env.example .env         # sk_test_ key from dashboard.prava.space + passkey identity
+make setup    # uv sync + .env with a generated admin token
+make test     # 322 tests; no network, no sandbox transactions
+make serve    # http://127.0.0.1:8080 — dashboard + API
+```
 
-uv run pytest                # no network, no sandbox transactions
-uv run python -m payoptimize serve    # http://127.0.0.1:8080 — dashboard + API
+The Prava rail stays off until you put a real `sk_test_` key in `.env`; `method="prava"`
+returns a clean 503 until then, and the card rails work regardless. To point an agent at
+it, run the MCP server with `PAYOPTIMIZE_API_URL` and `PAYOPTIMIZE_API_KEY` set:
+
+```bash
+uv run python -m payoptimize.server                       # MCP over stdio
+uv run python scripts/agent_demo.py --url … --key pok_…   # the same flow, with a terminal QR
 ```
 
 See [`docs/PLAN.md`](docs/PLAN.md) for the full architecture, schema, router math,
@@ -89,7 +125,22 @@ build window, in this repo.
 (session mint, payment-result poll with cache-buster, credential extraction,
 `report-status` settlement, live-key safety guards) is ported from the author's
 pre-hackathon project [canibuy](https://github.com/Pawansingh3889/canibuy), where it
-was written and verified against the live sandbox. Everything else here is in-window.
+was written and verified against the live sandbox. It is carried over near-verbatim on
+purpose — rewriting a verified integration is how it quietly stops being verified. Two
+changes: the env prefix, and canibuy's merchant-localhost guard is gone (it pointed
+sessions at its own fixture storefront and had to refuse spending real money on it;
+here the merchant is the API caller). The adapter, the settle poller, and everything
+else in this repo are in-window.
+
+**Deviations from the plan, and why.** `docs/PLAN.md` was written before the code and
+is corrected where the code proved it wrong — the two disagreements are recorded there
+rather than quietly resolved. The router originally specified decaying only the *played*
+arm; built that way, a starved arm's counts freeze and a recovered rail was rediscovered
+in **1 of 5 seeded runs**, which breaks the demo's closing beat. Discounting every arm
+in the segment fixes it. And the deploy came up unreachable because a Fly machine is a
+Firecracker microVM, not a container — it has neither `/.dockerenv` nor
+`/run/.containerenv`, so container detection fell through to loopback. Deploying at the
+planned mid-build hour rather than last is what surfaced it.
 
 ## v2 roadmap
 
