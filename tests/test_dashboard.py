@@ -199,3 +199,152 @@ def test_feed_escapes_hostile_content(db: str) -> None:
 def test_demo_tenant_is_not_exposed_by_name(client: TestClient, db: str) -> None:
     tenancy.ensure_demo_tenant(db_path=db)
     assert tenancy.DEMO_TENANT_EMAIL not in client.get("/").text
+
+
+# --- panel 3: provider mix ---------------------------------------------------
+
+
+def _mix(buckets: int = 6) -> list[dict]:
+    rows = []
+    for i in range(buckets):
+        for provider, n in (("stripe_sim", 12), ("adyen_sim", 6), ("braintree_sim", 2)):
+            rows.append({"bucket_ts": 1_000 + i * 30, "provider": provider, "attempts": n})
+    return rows
+
+
+def test_mix_chart_stacks_every_rail() -> None:
+    svg = dashboard.render_mix_chart(_mix())
+
+    assert svg.count("<path") == 3  # one band per rail
+    assert "var(--rail-1)" in svg and "var(--rail-3)" in svg
+    assert "stroke-dasharray" not in svg
+
+
+def test_mix_bands_are_directly_labeled_not_colour_alone() -> None:
+    """The validator puts the third rail hue at 2.74:1 on the light surface,
+    below 3:1. The relief rule for that is visible labels — so identity must
+    never rest on colour here."""
+    svg = dashboard.render_mix_chart(_mix())
+
+    for rail in ("stripe", "adyen", "braintree"):
+        assert rail in svg  # in the band label and the legend
+    assert svg.count("swatch") == 3
+
+
+def test_mix_chart_needs_two_buckets_before_it_draws() -> None:
+    single = [{"bucket_ts": 1_000, "provider": "stripe_sim", "attempts": 5}]
+    assert "Collecting traffic" in dashboard.render_mix_chart(single)
+
+
+def test_mix_shows_a_shift_when_one_rail_takes_over() -> None:
+    """The demo beat: traffic slides off a degraded rail."""
+    rows = []
+    for i in range(6):
+        stripe = 12 if i < 3 else 1
+        adyen = 2 if i < 3 else 13
+        rows.append({"bucket_ts": 1_000 + i * 30, "provider": "stripe_sim", "attempts": stripe})
+        rows.append({"bucket_ts": 1_000 + i * 30, "provider": "adyen_sim", "attempts": adyen})
+
+    svg = dashboard.render_mix_chart(rows)
+    assert svg.count("<path") == 2
+    assert "adyen" in svg
+
+
+# --- panel 5: corridors ------------------------------------------------------
+
+
+def test_corridor_table_shows_the_delta() -> None:
+    html = dashboard.render_corridors(
+        [
+            {
+                "segment": "US:USD:visa",
+                "volume": 120,
+                "router_auth_rate": 0.94,
+                "baseline_auth_rate": 0.87,
+            }
+        ]
+    )
+    assert "US:USD:visa" in html
+    assert "94.0%" in html
+    assert "+7.0" in html
+
+
+def test_corridor_table_admits_a_missing_arm() -> None:
+    """One arm with no traffic is not a zero-point delta."""
+    html = dashboard.render_corridors(
+        [{"segment": "DE:EUR:visa", "volume": 10, "router_auth_rate": 0.9}]
+    )
+    assert "&mdash;" in html
+
+
+def test_corridor_table_empty() -> None:
+    assert "No corridor traffic" in dashboard.render_corridors([])
+
+
+# --- panel 7: merchants ------------------------------------------------------
+
+
+def test_tenant_strip_meters_volume_without_leaking_identity() -> None:
+    html = dashboard.render_tenants(
+        [
+            {"name": "Acme Corp", "volume": 40, "succeeded": 36, "authorized_cents": 45000},
+            {"name": "Rival Ltd", "volume": 10, "succeeded": 9, "authorized_cents": 9000},
+        ]
+    )
+    assert "Acme Corp" in html
+    assert "40 payments" in html
+    assert "$450" in html
+    assert "@" not in html  # no email ever reaches this page
+
+
+def test_tenant_strip_empty() -> None:
+    assert "No merchant traffic" in dashboard.render_tenants([])
+
+
+# --- the assembled page ------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "name", ["stats", "authchart", "mixchart", "tiles", "corridors", "tenants", "feed"]
+)
+def test_every_panel_has_a_fragment(client: TestClient, name: str) -> None:
+    assert client.get(f"/fragments/{name}").status_code == 200
+
+
+def test_the_page_renders_all_seven_panels(client: TestClient, merchant: dict) -> None:
+    for _ in range(12):
+        client.post("/v1/payments", json=CARD, headers=merchant["auth"])
+
+    body = client.get("/").text
+
+    for anchor in ("stats", "authchart", "mixchart", "tiles", "corridors", "tenants", "feed"):
+        assert f'id="{anchor}"' in body
+        # Every panel placeholder was substituted — a missing one renders the
+        # literal "{mixchart}" and is invisible in a screenshot review.
+        assert "{" + anchor + "}" not in body
+
+
+def test_hero_row_reports_throughput(client: TestClient, merchant: dict) -> None:
+    client.post("/v1/payments", json=CARD, headers=merchant["auth"])
+    assert "Throughput" in client.get("/fragments/stats").text
+
+
+def test_a_bands_label_and_its_tooltip_agree() -> None:
+    """They answer the same question, so they must give the same number. An
+    earlier version labelled the peak bucket while the tooltip gave the window
+    average — 80% against 46% for one band."""
+    import re
+
+    rows = []
+    for i in range(6):
+        stripe = 18 if i < 3 else 2
+        adyen = 2 if i < 3 else 18
+        rows.append({"bucket_ts": 1_000 + i * 30, "provider": "stripe_sim", "attempts": stripe})
+        rows.append({"bucket_ts": 1_000 + i * 30, "provider": "adyen_sim", "attempts": adyen})
+
+    svg = dashboard.render_mix_chart(rows)
+    labels = dict(re.findall(r'font-weight="600"[^>]*>(\w+) (\d+)%<', svg))
+    tooltips = dict(re.findall(r"<title>(\w+)_sim: (\d+)% of first attempts</title>", svg))
+
+    assert labels and tooltips
+    assert labels == tooltips

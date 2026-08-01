@@ -373,20 +373,39 @@ def _summary_for_dashboard(engine: Engine) -> dict[str, Any]:
         "by_mode": modes,
         "uplift": uplift,
         "recovered_cents": recovered_cents,
+        "tx_per_min": round(volume / (CHART_WINDOW_SECONDS / 60), 1),
     }
 
 
-async def dashboard_page(request: Request) -> HTMLResponse:
-    engine = _engine(request)
-    return HTMLResponse(
-        dashboard.render_page(
-            stats=dashboard.render_stats(_summary_for_dashboard(engine)),
-            authchart=_auth_chart(engine),
-            tiles=dashboard.render_tiles(engine.health.snapshot()),
-            feed=dashboard.render_feed(
-                store.recent_payments_with_attempts(limit=FEED_LIMIT, db_path=engine.db_path)
-            ),
+def _mix_chart(engine: Engine) -> str:
+    return dashboard.render_mix_chart(
+        store.provider_mix_series(
+            since=iso_since(CHART_WINDOW_SECONDS),
+            bucket_seconds=CHART_BUCKET_SECONDS,
+            db_path=engine.db_path,
+        ),
+        bucket_seconds=CHART_BUCKET_SECONDS,
+    )
+
+
+def _corridors(engine: Engine) -> str:
+    rows: dict[str, dict[str, Any]] = {}
+    for row in store.payments_by_corridor(
+        since=iso_since(CHART_WINDOW_SECONDS),
+        method=PaymentMethod.CARD,
+        db_path=engine.db_path,
+    ):
+        entry = rows.setdefault(row["segment"], {"segment": row["segment"], "volume": 0})
+        entry["volume"] += int(row["volume"])
+        entry[f"{row['routing_mode']}_auth_rate"] = _rate(
+            int(row["succeeded"] or 0), int(row["volume"])
         )
+    return dashboard.render_corridors(sorted(rows.values(), key=lambda r: -r["volume"]))
+
+
+def _tenants(engine: Engine) -> str:
+    return dashboard.render_tenants(
+        store.tenant_volumes(since=iso_since(CHART_WINDOW_SECONDS), db_path=engine.db_path)
     )
 
 
@@ -409,22 +428,34 @@ def _epoch(ts: str) -> int:
     return int(datetime.fromisoformat(ts).timestamp())
 
 
-async def fragment(request: Request) -> HTMLResponse:
+FRAGMENTS = {
+    "stats": lambda e: dashboard.render_stats(_summary_for_dashboard(e)),
+    "authchart": _auth_chart,
+    "mixchart": _mix_chart,
+    "tiles": lambda e: dashboard.render_tiles(e.health.snapshot()),
+    "corridors": _corridors,
+    "tenants": _tenants,
+    "feed": lambda e: dashboard.render_feed(
+        store.recent_payments_with_attempts(limit=FEED_LIMIT, db_path=e.db_path)
+    ),
+}
+
+
+async def dashboard_page(request: Request) -> HTMLResponse:
     engine = _engine(request)
+    return HTMLResponse(
+        dashboard.render_page(**{name: render(engine) for name, render in FRAGMENTS.items()})
+    )
+
+
+async def fragment(request: Request) -> HTMLResponse:
+    """One panel, rendered on its own so the page can poll each independently —
+    and so every panel is a plain GET a test can assert on."""
     name = request.path_params["name"]
-    if name == "stats":
-        return HTMLResponse(dashboard.render_stats(_summary_for_dashboard(engine)))
-    if name == "authchart":
-        return HTMLResponse(_auth_chart(engine))
-    if name == "tiles":
-        return HTMLResponse(dashboard.render_tiles(engine.health.snapshot()))
-    if name == "feed":
-        return HTMLResponse(
-            dashboard.render_feed(
-                store.recent_payments_with_attempts(limit=FEED_LIMIT, db_path=engine.db_path)
-            )
-        )
-    raise HTTPException(status_code=404, detail=f"no fragment {name!r}")
+    render = FRAGMENTS.get(name)
+    if render is None:
+        raise HTTPException(status_code=404, detail=f"no fragment {name!r}")
+    return HTMLResponse(render(_engine(request)))
 
 
 # --- admin -------------------------------------------------------------------

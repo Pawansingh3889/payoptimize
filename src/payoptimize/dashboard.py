@@ -25,6 +25,7 @@ STYLE = """
   --surface: #fcfcfb; --surface-2: #f4f3f0; --line: #e6e4df;
   --ink: #0b0b0b; --ink-2: #52514e; --ink-3: #7c7a74;
   --router: #2a78d6; --baseline: #eb6834;
+  --rail-1: #2a78d6; --rail-2: #eb6834; --rail-3: #1baf7a;
   --good: #0ca30c; --warn: #fab219; --serious: #ec835a; --critical: #d03b3b;
   --real: #4a3aa7;
 }
@@ -34,6 +35,7 @@ STYLE = """
     --surface: #1a1a19; --surface-2: #242423; --line: #383835;
     --ink: #ffffff; --ink-2: #c3c2b7; --ink-3: #8e8c84;
     --router: #3987e5; --baseline: #d95926;
+    --rail-1: #3987e5; --rail-2: #d95926; --rail-3: #199e70;
     --real: #9085e9;
   }
 }
@@ -42,6 +44,7 @@ STYLE = """
   --surface: #1a1a19; --surface-2: #242423; --line: #383835;
   --ink: #ffffff; --ink-2: #c3c2b7; --ink-3: #8e8c84;
   --router: #3987e5; --baseline: #d95926;
+  --rail-1: #3987e5; --rail-2: #d95926; --rail-3: #199e70;
   --real: #9085e9;
 }
 * { box-sizing: border-box; }
@@ -97,6 +100,14 @@ tr:last-child td { border-bottom: none; }
 .ok { color: var(--good); } .no { color: var(--critical); }
 .empty { color: var(--ink-3); font-size: 13px; padding: 8px 0; }
 .scroll { overflow-x: auto; }
+.two { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+@media (max-width: 860px) { .two { grid-template-columns: 1fr; } }
+.strip { display: flex; flex-wrap: wrap; gap: 10px; }
+.merchant { border: 1px solid var(--line); border-radius: 8px; padding: 9px 12px; background: var(--surface); }
+.merchant .who { font-weight: 600; font-size: 13px; }
+.merchant .num { font-size: 12px; color: var(--ink-2); font-variant-numeric: tabular-nums; }
+td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
+.bar { height: 6px; border-radius: 3px; background: var(--router); display: inline-block; vertical-align: middle; }
 footer { max-width: 1180px; margin: 20px auto 0; color: var(--ink-3); font-size: 12px; }
 """
 
@@ -116,14 +127,20 @@ _PAGE = """<!doctype html>
   <div id="stats">{stats}</div>
   <section class="card"><h2>Authorization rate &mdash; router vs baseline</h2>
     <div id="authchart">{authchart}</div></section>
+  <section class="card"><h2>Where the router sent first attempts</h2>
+    <div id="mixchart">{mixchart}</div></section>
   <section class="card"><h2>Provider health</h2><div id="tiles">{tiles}</div></section>
+  <div class="two">
+    <section class="card"><h2>By corridor</h2><div class="scroll" id="corridors">{corridors}</div></section>
+    <section class="card"><h2>Merchants</h2><div id="tenants">{tenants}</div></section>
+  </div>
   <section class="card"><h2>Recent transactions</h2>
     <div class="scroll" id="feed">{feed}</div></section>
 </main>
 <footer>Simulated rails are labeled SIMULATED everywhere they appear. Prava is a real
 sandbox integration and is labeled REAL. Auth rate and uplift cover card traffic only.</footer>
 <script>
-const F = ["stats", "authchart", "tiles", "feed"];
+const F = ["stats", "authchart", "mixchart", "tiles", "corridors", "tenants", "feed"];
 async function poll() {{
   await Promise.all(F.map(async n => {{
     try {{ document.getElementById(n).innerHTML = await (await fetch("/fragments/" + n)).text(); }}
@@ -167,6 +184,7 @@ def render_stats(summary: dict[str, Any]) -> str:
     tiles = [
         ("Auth rate", _pct(summary["auth_rate"]), f"{summary['volume']} card payments"),
         ("Router vs baseline", uplift_value, uplift_note),
+        ("Throughput", f"{summary.get('tx_per_min', 0):.0f}/min", "live traffic"),
         ("Router arm", _pct(router["auth_rate"]), f"{router['volume']} payments"),
         ("Baseline arm", _pct(baseline["auth_rate"]), f"{baseline['volume']} payments"),
         ("Revenue recovered", f"${recovered / 100:,.0f}", "vs the baseline's rate"),
@@ -369,3 +387,184 @@ def render_feed(payments: list[dict[str, Any]]) -> str:
 
 def render_page(**fragments: str) -> str:
     return _PAGE.format(style=STYLE, **fragments)
+
+
+# --- panel 3: provider mix ---------------------------------------------------
+
+RAIL_COLOURS = ("var(--rail-1)", "var(--rail-2)", "var(--rail-3)")
+
+
+def render_mix_chart(
+    series: list[dict[str, Any]],
+    *,
+    bucket_seconds: int = 30,
+    width: int = 1100,
+    height: int = 210,
+) -> str:
+    """A 100% stacked area of where the router's first attempts went.
+
+    Part-to-whole over time, so the bands sum to the full height and a shift
+    reads as one band eating another — which is exactly the story when a rail
+    degrades and traffic slides elsewhere.
+
+    Every band carries a visible label. That is not decoration: the dataviz
+    validator flags the third rail hue at 2.74:1 on the light surface, below the
+    3:1 bar, and the relief rule for that is direct labels or a table view. It
+    also covers the weak tritan separation between the second and third hues in
+    dark mode. Colour never carries identity here on its own.
+    """
+    left, right, top, bottom = 8, 8, 8, 22
+    plot_w, plot_h = width - left - right, height - top - bottom
+
+    buckets = sorted({int(row["bucket_ts"]) for row in series})
+    if len(buckets) < 2:
+        return (
+            '<p class="empty">Collecting traffic &mdash; the mix needs at least two '
+            f"{bucket_seconds}-second buckets.</p>"
+        )
+
+    rails = sorted({str(row["provider"]) for row in series})
+    counts: dict[int, dict[str, int]] = {b: dict.fromkeys(rails, 0) for b in buckets}
+    for row in series:
+        counts[int(row["bucket_ts"])][str(row["provider"])] = int(row["attempts"])
+
+    t0, t1 = buckets[0], buckets[-1]
+    span = max(1, t1 - t0)
+
+    def x_of(ts: int) -> float:
+        return left + (ts - t0) / span * plot_w
+
+    shares: dict[str, list[float]] = {rail: [] for rail in rails}
+    for bucket in buckets:
+        total = sum(counts[bucket].values()) or 1
+        for rail in rails:
+            shares[rail].append(counts[bucket][rail] / total)
+
+    parts = [
+        (
+            f'<svg viewBox="0 0 {width} {height}" width="100%" role="img" '
+            f'aria-label="Share of router first attempts by provider over time" '
+            f'style="display:block;max-width:100%">'
+        )
+    ]
+    baseline = [0.0] * len(buckets)
+    totals = {rail: sum(shares[rail]) / len(buckets) for rail in rails}
+    for index, rail in enumerate(rails):
+        upper = [baseline[i] + shares[rail][i] for i in range(len(buckets))]
+        forward = " ".join(
+            f"{'M' if i == 0 else 'L'}{x_of(b):.1f},{top + (1 - upper[i]) * plot_h:.1f}"
+            for i, b in enumerate(buckets)
+        )
+        back = " ".join(
+            f"L{x_of(b):.1f},{top + (1 - baseline[i]) * plot_h:.1f}"
+            for i, b in reversed(list(enumerate(buckets)))
+        )
+        colour = RAIL_COLOURS[index % len(RAIL_COLOURS)]
+        # The 2px surface stroke IS the gap between stacked segments — a border
+        # drawn to separate marks would be the anti-pattern; this is a spacer.
+        parts.append(
+            f'<path d="{forward} {back} Z" fill="{colour}" fill-opacity="0.85" '
+            f'stroke="var(--surface-2)" stroke-width="2"><title>{_esc(rail)}: '
+            f"{totals[rail]:.0%} of first attempts</title></path>"
+        )
+        baseline = upper
+
+    # Direct labels, one per band, at its widest point.
+    baseline = [0.0] * len(buckets)
+    for index, rail in enumerate(rails):
+        upper = [baseline[i] + shares[rail][i] for i in range(len(buckets))]
+        widest = max(range(len(buckets)), key=lambda i: shares[rail][i])
+        if shares[rail][widest] > 0.10:  # too thin to hold a label
+            mid_y = top + (1 - (baseline[widest] + upper[widest]) / 2) * plot_h
+            anchor_x = min(max(x_of(buckets[widest]), left + 46), width - right - 46)
+            # The label is placed at the band's widest point purely so it fits,
+            # but it states the band's share across the WHOLE window — the same
+            # number as its tooltip. Labelling the peak bucket instead read as
+            # "adyen has 80%" when the band averaged 46%, which is two different
+            # answers to one question.
+            parts.append(
+                f'<text x="{anchor_x:.1f}" y="{mid_y + 4:.1f}" text-anchor="middle" '
+                f'font-size="11" font-weight="600" fill="#ffffff" '
+                f'style="paint-order:stroke;stroke:rgba(0,0,0,.35);stroke-width:3px">'
+                f"{_esc(rail.removesuffix('_sim'))} {totals[rail]:.0%}</text>"
+            )
+        baseline = upper
+
+    minutes = round(span / 60)
+    parts.append(
+        f'<text x="{left}" y="{height - 6}" font-size="11" fill="var(--ink-3)">'
+        f"{minutes} min ago</text>"
+        f'<text x="{width - right}" y="{height - 6}" text-anchor="end" font-size="11" '
+        f'fill="var(--ink-3)">now</text></svg>'
+    )
+
+    legend = (
+        '<div class="legend">'
+        + "".join(
+            f'<span><i class="swatch" style="height:10px;border-radius:2px;'
+            f'background:{RAIL_COLOURS[i % len(RAIL_COLOURS)]}"></i>'
+            f"{_esc(rail.removesuffix('_sim'))}</span>"
+            for i, rail in enumerate(rails)
+        )
+        + "</div>"
+    )
+    return legend + "".join(parts)
+
+
+# --- panel 5: corridors ------------------------------------------------------
+
+
+def render_corridors(rows: list[dict[str, Any]]) -> str:
+    """Auth rate per corridor, router against baseline.
+
+    The per-corridor split is the argument for segmenting the bandit at all: one
+    global average would hide that a rail strong in US:USD:visa is weak in
+    DE:EUR:visa, which is precisely the money the router recovers.
+    """
+    if not rows:
+        return '<p class="empty">No corridor traffic yet.</p>'
+    cells = []
+    for row in rows:
+        router = row.get("router_auth_rate")
+        baseline = row.get("baseline_auth_rate")
+        if router is None or baseline is None:
+            delta = '<span class="empty">&mdash;</span>'
+        else:
+            points = (router - baseline) * 100
+            css = "ok" if points > 0 else "no" if points < 0 else ""
+            delta = f'<span class="{css}">{points:+.1f}</span>'
+        cells.append(
+            f"<tr><td>{_esc(row['segment'])}</td>"
+            f'<td class="num">{row["volume"]}</td>'
+            f'<td class="num">{_pct(router) if router is not None else "&mdash;"}</td>'
+            f'<td class="num">{_pct(baseline) if baseline is not None else "&mdash;"}</td>'
+            f'<td class="num">{delta}</td></tr>'
+        )
+    return (
+        '<table><thead><tr><th>Corridor</th><th class="num">Vol</th>'
+        '<th class="num">Router</th><th class="num">Baseline</th>'
+        '<th class="num">Δ pts</th></tr></thead>'
+        f"<tbody>{''.join(cells)}</tbody></table>"
+    )
+
+
+# --- panel 7: merchants ------------------------------------------------------
+
+
+def render_tenants(rows: list[dict[str, Any]]) -> str:
+    """Volume metered per merchant. Names only — this is a public page, and an
+    email address is not an aggregate."""
+    if not rows:
+        return '<p class="empty">No merchant traffic yet.</p>'
+    busiest = max(int(r["volume"]) for r in rows) or 1
+    cells = []
+    for row in rows:
+        volume = int(row["volume"])
+        authorized = int(row["authorized_cents"] or 0)
+        width = max(6, round(volume / busiest * 90))
+        cells.append(
+            f'<div class="merchant"><div class="who">{_esc(row["name"])}</div>'
+            f'<div class="num">{volume} payments · ${authorized / 100:,.0f} authorized</div>'
+            f'<div><i class="bar" style="width:{width}px"></i></div></div>'
+        )
+    return f'<div class="strip">{"".join(cells)}</div>'
