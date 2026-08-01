@@ -43,6 +43,17 @@ class RailUnavailable(RuntimeError):
     """A payment asked for a rail this deployment has not configured."""
 
 
+# Free-text like Prava's own codes rather than a DeclineCode member: these
+# describe our own failure to start, not an issuer's answer, and should_cascade
+# already refuses anything it does not recognise.
+RAIL_UNAVAILABLE_CODE = "rail_unavailable"
+STARTUP_ERROR_CODE = "provider_error"
+
+
+def _startup_failure_code(exc: BaseException) -> str:
+    return RAIL_UNAVAILABLE_CODE if isinstance(exc, RailUnavailable) else STARTUP_ERROR_CODE
+
+
 def prava_configured() -> bool:
     """Whether the real rail can be offered at all.
 
@@ -139,10 +150,24 @@ class Engine:
             db_path=self.db_path,
         )
 
-        if request.method is PaymentMethod.PRAVA:
-            await self._start_prava(payment_id, request, segment, http=http)
-        else:
-            await self._run_cascade(payment_id, request, segment, mode)
+        try:
+            if request.method is PaymentMethod.PRAVA:
+                await self._start_prava(payment_id, request, segment, http=http)
+            else:
+                await self._run_cascade(payment_id, request, segment, mode)
+        except Exception as exc:
+            # The row already exists, so an exception here would strand it in
+            # `pending` for ever — no attempts, no resolution, and on the
+            # dashboard it reads as money in flight. One such payment is sitting
+            # on production from a method="prava" call made before the rail was
+            # configured. Resolve it, then let the caller have its error.
+            store.finalize_payment(
+                payment_id,
+                status=PaymentStatus.FAILED,
+                decline_code=_startup_failure_code(exc),
+                db_path=self.db_path,
+            )
+            raise
         return self.load(payment_id)
 
     async def _run_cascade(

@@ -462,3 +462,25 @@ def test_admin_state_lists_only_injectable_rails(db: str) -> None:
     assert "prava" not in body["injections"]
     assert set(body["injections"]) == {"stripe_sim", "braintree_sim", "adyen_sim"}
     assert body["real_rails"] == ["prava"]
+
+
+def test_a_payment_is_never_stranded_when_the_rail_cannot_start(
+    client: TestClient, merchant: dict, db: str
+) -> None:
+    """A prava payment created before the rail was configured sat in `pending`
+    on production for over an hour — no attempts, no resolution, and pinned to
+    the dashboard looking like money in flight."""
+    from payoptimize import store as _store
+
+    response = client.post(
+        "/v1/payments",
+        json={"amount_cents": 1250, "currency": "USD", "method": "prava"},
+        headers=merchant["auth"],
+    )
+    assert response.status_code == 503  # the caller still learns what happened
+
+    stranded = [p for p in _store.list_payments(limit=50, db_path=db) if p["status"] == "pending"]
+    assert stranded == [], "a payment was left pending with no way to resolve"
+
+    failed = _store.list_payments(limit=50, status="failed", db_path=db)
+    assert any(p["decline_code"] == "rail_unavailable" for p in failed)
