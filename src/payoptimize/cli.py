@@ -8,6 +8,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -17,14 +18,24 @@ from .models import PaymentRequest
 
 
 def _bind_host() -> str:
-    """0.0.0.0 inside a container, loopback everywhere else.
+    """0.0.0.0 where the port would otherwise be unreachable, loopback elsewhere.
 
     Binding a laptop's dev server to every interface is how a demo ends up
-    reachable from the conference wifi. Containers have no such choice — the
-    port would be unreachable otherwise — so detect one rather than asking.
+    reachable from the conference wifi, so this is detected rather than assumed.
+
+    The file checks alone are not enough, which the first Fly deploy proved:
+    a Fly machine is a Firecracker microVM, not a container, and has neither
+    /.dockerenv nor /run/.containerenv. It bound loopback and fly-proxy could
+    not reach it — "the app is not listening on the expected address". Hence the
+    FLY_* check, and hence PAYOPTIMIZE_HOST for the next platform whose shape I
+    have guessed wrong.
     """
+    explicit = os.environ.get("PAYOPTIMIZE_HOST", "").strip()
+    if explicit:
+        return explicit
     in_container = Path("/.dockerenv").exists() or Path("/run/.containerenv").exists()
-    return "0.0.0.0" if in_container else "127.0.0.1"
+    on_fly = bool(os.environ.get("FLY_APP_NAME") or os.environ.get("FLY_MACHINE_ID"))
+    return "0.0.0.0" if in_container or on_fly else "127.0.0.1"
 
 
 def serve(args: argparse.Namespace) -> int:
