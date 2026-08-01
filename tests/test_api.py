@@ -446,3 +446,19 @@ def test_provider_health_is_public_and_labeled(client: TestClient) -> None:
     assert all(p["label"] == "SIMULATED" for p in body)
     assert all(p["real"] is False for p in body)
     assert {"name", "state", "auth_rate", "p95_ms", "fee"} <= set(body[0])
+
+
+def test_admin_state_lists_only_injectable_rails(db: str) -> None:
+    """The real rail must not appear under `injections`. /admin/outage refuses
+    to fake it, and the admin view should not imply otherwise."""
+    import random as _random
+
+    from payoptimize.engine import Engine as _Engine
+
+    engine = _Engine.build(db_path=db, rng=_random.Random(42), latency_scale=0, with_prava=True)
+    with TestClient(create_app(engine=engine)) as client:
+        body = client.get("/admin/state", headers=ADMIN).json()
+
+    assert "prava" not in body["injections"]
+    assert set(body["injections"]) == {"stripe_sim", "braintree_sim", "adyen_sim"}
+    assert body["real_rails"] == ["prava"]

@@ -510,9 +510,14 @@ async def admin_state(request: Request) -> JSONResponse:
                     "created": generator.created,
                 }
             ),
+            # Injectable rails only. Listing the real rail here with a default
+            # "healthy" would imply an operator could stage an outage on it —
+            # /admin/outage refuses exactly that, and the admin view should not
+            # suggest otherwise.
             "injections": {
-                name: getattr(p, "state", "healthy") for name, p in engine.providers.items()
+                name: p.state for name, p in engine.providers.items() if hasattr(p, "state")
             },
+            "real_rails": sorted(name for name, p in engine.providers.items() if p.real),
         }
     )
 
