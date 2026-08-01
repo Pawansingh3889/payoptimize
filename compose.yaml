@@ -1,0 +1,34 @@
+# Fallback if Fly misbehaves on demo day: same image, same invariants, one host.
+#
+#   podman-compose up --build     (or: docker compose up --build)
+#
+# The bind mount is a DIRECTORY, not a file. SQLite in WAL mode writes
+# payoptimize.sqlite3-wal and -shm next to the database; mounting the single
+# file would strand those siblings inside the container.
+#
+# `:z` rather than `:Z` — this is Fedora with SELinux, and `:Z` relabels the
+# directory exclusively to one container, which breaks the next `up` if the
+# container is recreated.
+
+services:
+  payoptimize:
+    build: .
+    image: payoptimize:local
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./data:/data:z
+    # Optional on purpose. With a bare `- .env` this file refuses to start at
+    # all when no .env is present — which is precisely the state you are in at
+    # 2am when Fly has gone sideways and this is the fallback you reach for.
+    # Without it the service still runs; only the Prava rail stays unconfigured.
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      PAYOPTIMIZE_DB: /data/payoptimize.sqlite3
+      PAYOPTIMIZE_PORT: "8080"
+    restart: unless-stopped
+    # One replica, always. See fly.toml for why this is not a tuning knob.
+    deploy:
+      replicas: 1

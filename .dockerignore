@@ -1,0 +1,18 @@
+# Keep the build context to what the image actually installs.
+.git/
+.venv/
+data/
+docs/
+tests/
+scripts/
+**/__pycache__/
+**/*.pyc
+.pytest_cache/
+.ruff_cache/
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
+.env
+compose.yaml
+Dockerfile
+.dockerignore
