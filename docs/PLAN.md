@@ -27,9 +27,16 @@ commit on `main`, all work on `feat/*`, merge to main only when
    still feed its health tile and appear (badged REAL) in the feed.
 3. **The AI is a real online learner — discounted Thompson sampling.** Plain Beta
    posteriors will NOT visibly react to an outage on demo timescales (after ~2,000
-   successes, Beta(1800,200) needs hundreds of failures to move). So: decay the played
-   arm's counts by γ=0.98 per update (effective window ≈ 50 obs/arm) plus a **2%
-   forced-exploration probe** so a "dead" arm's recovery is ever detected.
+   successes, Beta(1800,200) needs hundreds of failures to move). So: discount **every
+   arm in the segment** by γ=0.99 per outcome, rewarding the played arm only, plus a
+   **2% forced-exploration probe**.
+   **Revised at implementation, on measurement — see §4.** This originally specified
+   decaying the *played arm only*. Built that way, a starved arm's counts freeze at
+   their beat-down state and nothing pulls them back, so recovery rests entirely on the
+   probe: over 5 seeds a recovered rail was rediscovered in **1 of 5 runs** within 4,000
+   decisions, which breaks the closing beat of §13. Discounting every arm lets a starved
+   arm drift back to Beta(1,1) — uncertainty rather than a verdict — and Thompson
+   sampling reaches for it unprompted.
 4. **Uplift is measured, not claimed:** 50/50 deterministic A/B split on generator
    traffic; baseline = round-robin with the *same* cascade rules, so the only delta is
    routing intelligence.
@@ -151,8 +158,20 @@ health_snapshots table — health derives from `attempts` over a rolling window.
 
 - **Arms:** (provider, segment); segment = `country:currency:card_brand`. ~15 arms at
   5 generator corridors × 3 card providers. Prior **Beta(1,1)**.
-- **Update on outcome r ∈ {0,1}** (played arm only): `α = 0.98·α + r`,
-  `β = 0.98·β + (1−r)`.
+- **Update on outcome r ∈ {0,1}:** discount every arm in the segment, floored at the
+  prior — `α = max(0.99·α, 1)`, `β = max(0.99·β, 1)` — then add the reward to the played
+  arm alone: `α += r`, `β += (1−r)`. The floor is load-bearing: an arm forgets its
+  evidence, never the fact that "no opinion" is where it started.
+  γ chosen by sweep (5 seeds × 4,000 payments, 0.95/0.85/0.80 corridor):
+
+  | γ | best-arm share | uplift | degraded gap | reacts in | recovers in |
+  |---|---|---|---|---|---|
+  | 0.98 | 66% | +3.6 pts | +13.0 | 140 | 160 (64 s) |
+  | **0.99** | **80%** | **+5.3 pts** | **+14.1** | **130** | **280 (112 s)** |
+  | 0.995 | 91% | +6.8 pts | +13.9 | 180 | 510 (204 s) |
+
+  γ=0.995 converges hardest but takes 3.4 min to forgive a recovered rail — longer than
+  the whole demo. γ=0.99 meets every §9 target with the fastest usable recovery.
 - **Decision:** with p=0.02 pick a uniformly random eligible provider (recovery
   probe); else sample θ ~ Beta(α,β) per eligible provider, pick argmax. Skip providers
   whose health state is `down`.
@@ -179,11 +198,16 @@ health_snapshots table — health derives from `attempts` over a rolling window.
   0.83 · `US:USD:amex` braintree 0.93 / stripe 0.90 / adyen 0.80. Latency lognormal
   (median 120–350 ms via `asyncio.sleep`, scale=0 in tests). Fees: stripe 290bps+30¢ /
   adyen 260bps+22¢ / braintree 275bps+30¢ (UI only).
-- **Outage-recovery timing (rehearsed numbers):** generator 5 tx/s, 50/50 split →
-  2.5 tx/s router arm. Degrade stripe_sim (auth → 0.45): ~20 bad outcomes (~15–20 s)
-  drop its posterior below competitors; traffic shifts within ~20–30 s; the 30 s
-  rolling auth line visibly recovers **45–90 s after injection** while baseline stays
-  ~8–10 pts down. `clear` → the 2% probe rediscovers recovery within ~60–90 s.
+- **Outage-recovery timing (MEASURED, not estimated — 5 seeds, shipped router):**
+  generator 5 tx/s, 50/50 split → 2.5 tx/s router arm. Degrade stripe_sim (auth → 0.45):
+  its share falls under 10% within **~130 decisions (~50 s)**, and the router holds
+  **+14 pts** over the baseline for as long as the degradation lasts — better than the
+  ~8–10 pts originally estimated, because `do_not_honor` never cascades so the baseline
+  eats every one of them. `clear` → the arm decays back to the prior and is
+  rediscovered in **~280 decisions (~110 s)**, no operator action required.
+  Corridor sims also cover `GB:GBP:mastercard` and `FR:EUR:mastercard` (the 4th and 5th
+  generator corridors, unspecified above), plus a per-provider baseline for any corridor
+  the API accepts that is not in the table.
 
 ## 5. Prava integration (the real rail)
 
