@@ -1,0 +1,45 @@
+# Exactly one machine, always running.
+#
+# Both of those are load-bearing rather than cost-saving defaults. The bandit's
+# posteriors live in this process's memory, so a second machine would be a
+# second router learning from half the traffic and disagreeing with the first —
+# and both would be writing the same SQLite file over a network volume.
+# auto_stop_machines is off and min_machines_running is 1 because a cold start
+# during judging is a blank dashboard, and because the traffic generator and the
+# Prava poller are lifespan tasks: a stopped machine stops learning and stops
+# settling approved payments.
+
+app = "payoptimize"
+primary_region = "iad"
+
+[build]
+
+[env]
+  PAYOPTIMIZE_DB = "/data/payoptimize.sqlite3"
+  PAYOPTIMIZE_PORT = "8080"
+  PAYOPTIMIZE_GENERATOR_TPS = "2"
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = false
+  auto_start_machines = true
+  min_machines_running = 1
+  processes = ["app"]
+
+  [http_service.concurrency]
+    type = "requests"
+    soft_limit = 200
+    hard_limit = 400
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "512mb"
+
+[mounts]
+  source = "data"
+  destination = "/data"
+
+# Deliberately no [[http_service.checks]] hitting a route that touches the
+# database: a health check that fails during a WAL checkpoint would restart the
+# machine and drop the in-memory posteriors. Fly's default TCP check is enough.
