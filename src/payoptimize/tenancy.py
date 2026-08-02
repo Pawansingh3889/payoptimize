@@ -35,16 +35,33 @@ def display_prefix(raw_key: str) -> str:
     return f"{raw_key[:_DISPLAY_CHARS]}…"
 
 
-def signup(name: str, email: str, *, db_path: str | None = None) -> tuple[int, str]:
+def signup(
+    name: str,
+    email: str,
+    *,
+    merchant_name: str = "",
+    merchant_url: str = "",
+    merchant_country: str = "",
+    db_path: str | None = None,
+) -> tuple[int, str]:
     """Create a tenant and its first key. Returns (tenant_id, raw key) — the
     only moment the raw key exists outside the caller's process."""
-    request = SignupRequest(name=name, email=email)
+    request = SignupRequest(
+        name=name,
+        email=email,
+        merchant_name=merchant_name,
+        merchant_url=merchant_url,
+        merchant_country=merchant_country,
+    )
     raw_key = mint_key()
     tenant_id = store.create_tenant_with_key(
         request.name,
         request.email,
         hash_key(raw_key),
         display_prefix(raw_key),
+        merchant_name=request.merchant_name,
+        merchant_url=request.merchant_url,
+        merchant_country=request.merchant_country,
         db_path=db_path,
     )
     return tenant_id, raw_key

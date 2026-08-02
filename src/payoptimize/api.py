@@ -143,7 +143,14 @@ async def index(request: Request) -> JSONResponse:
 async def create_tenant(request: Request) -> JSONResponse:
     body = await _json_body(request)
     signup = SignupRequest(**body)
-    tenant_id, api_key = tenancy.signup(signup.name, signup.email, db_path=_engine(request).db_path)
+    tenant_id, api_key = tenancy.signup(
+        signup.name,
+        signup.email,
+        merchant_name=signup.merchant_name,
+        merchant_url=signup.merchant_url,
+        merchant_country=signup.merchant_country,
+        db_path=_engine(request).db_path,
+    )
     response = SignupResponse(
         tenant_id=tenant_id, api_key=api_key, key_prefix=tenancy.display_prefix(api_key)
     )

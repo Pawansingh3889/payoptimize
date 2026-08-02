@@ -106,6 +106,11 @@ class SignupRequest(BaseModel):
 
     name: str = Field(min_length=1, max_length=120)
     email: str = Field(min_length=3, max_length=254)
+    # The storefront this merchant sells from. Prava records it on every session
+    # as the merchant of record, so it is the merchant's own site — not ours.
+    merchant_name: str = Field(default="", max_length=120)
+    merchant_url: str = Field(default="", max_length=300)
+    merchant_country: str = Field(default="", max_length=2)
 
     @field_validator("name", "email")
     @classmethod
@@ -113,6 +118,14 @@ class SignupRequest(BaseModel):
         value = value.strip()
         if not value:
             raise ValueError("must not be blank")
+        return value
+
+    @field_validator("merchant_url")
+    @classmethod
+    def _merchant_url(cls, value: str) -> str:
+        value = value.strip()
+        if value and not value.startswith(("http://", "https://")):
+            raise ValueError("must be a URL starting http:// or https://")
         return value
 
     @field_validator("email")

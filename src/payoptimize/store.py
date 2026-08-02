@@ -32,7 +32,10 @@ CREATE TABLE IF NOT EXISTS tenants (
   email TEXT NOT NULL,
   created_ts TEXT NOT NULL,
   fee_bps INTEGER NOT NULL DEFAULT 45,
-  fee_fixed_cents INTEGER NOT NULL DEFAULT 5
+  fee_fixed_cents INTEGER NOT NULL DEFAULT 5,
+  merchant_name TEXT NOT NULL DEFAULT '',
+  merchant_url TEXT NOT NULL DEFAULT '',
+  merchant_country TEXT NOT NULL DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS api_keys (
   id INTEGER PRIMARY KEY,
@@ -141,6 +144,30 @@ def _apply_pragmas(conn: sqlite3.Connection) -> None:
     conn.execute("PRAGMA foreign_keys=ON")
 
 
+# Columns added after a database was first created. `CREATE TABLE IF NOT EXISTS`
+# does nothing to an existing table, so every column added later has to arrive
+# this way — a deployed volume and every local database would otherwise be one
+# schema behind and fail on the first query that names the new column.
+ADDED_COLUMNS: tuple[tuple[str, str, str], ...] = (
+    ("tenants", "merchant_name", "TEXT NOT NULL DEFAULT ''"),
+    ("tenants", "merchant_url", "TEXT NOT NULL DEFAULT ''"),
+    ("tenants", "merchant_country", "TEXT NOT NULL DEFAULT ''"),
+)
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    """Add any column this version expects and the file does not have.
+
+    Additive only, and never destructive: SQLite cannot drop or retype a column
+    without rebuilding the table, and a payments database is not something to
+    rebuild in a startup path.
+    """
+    for table, column, spec in ADDED_COLUMNS:
+        existing = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+        if column not in existing:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {spec}")
+
+
 def _ensure_schema(conn: sqlite3.Connection, path: str) -> None:
     """Run the schema once per DB path per process."""
     if path in _initialized:
@@ -149,6 +176,7 @@ def _ensure_schema(conn: sqlite3.Connection, path: str) -> None:
         if path in _initialized:
             return
         conn.executescript(SCHEMA)
+        _migrate(conn)
         conn.commit()
         # ":memory:" is a brand-new database on every connection, so caching it
         # as initialized would hand the next caller an empty schema.
@@ -204,6 +232,9 @@ def create_tenant_with_key(
     *,
     fee_bps: int = DEFAULT_FEE_BPS,
     fee_fixed_cents: int = DEFAULT_FEE_FIXED_CENTS,
+    merchant_name: str = "",
+    merchant_url: str = "",
+    merchant_country: str = "",
     db_path: str | None = None,
 ) -> int:
     """Signup is one transaction: a tenant with no key could never call the API,
@@ -211,9 +242,19 @@ def create_tenant_with_key(
     now = utc_now_iso()
     with transaction(db_path) as conn:
         cur = conn.execute(
-            "INSERT INTO tenants (name, email, created_ts, fee_bps, fee_fixed_cents)"
-            " VALUES (?, ?, ?, ?, ?)",
-            (name, email, now, fee_bps, fee_fixed_cents),
+            "INSERT INTO tenants (name, email, created_ts, fee_bps, fee_fixed_cents,"
+            " merchant_name, merchant_url, merchant_country)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                name,
+                email,
+                now,
+                fee_bps,
+                fee_fixed_cents,
+                merchant_name,
+                merchant_url,
+                merchant_country,
+            ),
         )
         tenant_id = cur.lastrowid
         assert tenant_id is not None  # INSERT always sets lastrowid

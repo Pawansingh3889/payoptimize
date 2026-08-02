@@ -400,12 +400,14 @@ class PravaProvider:
             "price": amount_to_decimal(request.amount_cents),
             "currency": request.currency,
         }
+        # The payment's own merchant wins, then this adapter's, then the
+        # deployment default — most specific first.
         name, url, country = configured_merchant()
         session = await run_in_threadpool(
             create_session,
-            self.merchant_name or name,
-            self.merchant_url or url,
-            self.merchant_country or country,
+            request.merchant_name or self.merchant_name or name,
+            request.merchant_url or self.merchant_url or url,
+            request.merchant_country or self.merchant_country or country,
             product,
             card_id=self.card_id or configured_card_id(),
             http=http,

@@ -152,7 +152,9 @@ class Engine:
 
         try:
             if request.method is PaymentMethod.PRAVA:
-                await self._start_prava(payment_id, request, segment, http=http)
+                await self._start_prava(
+                    payment_id, request, segment, tenant_id=tenant_id, http=http
+                )
             else:
                 await self._run_cascade(payment_id, request, segment, mode)
         except Exception as exc:
@@ -238,6 +240,7 @@ class Engine:
         request: PaymentRequest,
         segment: str,
         *,
+        tenant_id: int = 0,
         http: httpx.Client | None = None,
     ) -> None:
         """Mint a Prava session and hand back an approval URL.
@@ -253,6 +256,9 @@ class Engine:
                 "the prava rail is not configured on this deployment —"
                 " set PRAVA_SECRET_KEY and the user identity (see .env.example)"
             )
+        # Prava records who the sale was with, and that is the merchant whose
+        # payment this is — not us. We are the orchestrator in the middle.
+        tenant = store.get_tenant(tenant_id, db_path=self.db_path) or {}
         charge = ChargeRequest(
             payment_id=payment_id,
             amount_cents=request.amount_cents,
@@ -260,6 +266,9 @@ class Engine:
             country=request.country,
             segment=segment,
             description=request.description,
+            merchant_name=str(tenant.get("merchant_name") or ""),
+            merchant_url=str(tenant.get("merchant_url") or ""),
+            merchant_country=str(tenant.get("merchant_country") or ""),
         )
         attempt_id = store.insert_attempt(
             payment_id=payment_id,

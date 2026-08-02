@@ -73,6 +73,11 @@ class ChargeRequest:
     card_brand: str = ""
     segment: str = ""
     description: str = ""
+    # Whose sale this is. PayOptimize orchestrates it; the merchant is the
+    # tenant. Empty falls back to the deployment default.
+    merchant_name: str = ""
+    merchant_url: str = ""
+    merchant_country: str = ""
 
 
 @dataclass(frozen=True, slots=True)
