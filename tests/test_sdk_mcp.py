@@ -172,6 +172,10 @@ def test_tools_are_registered_with_descriptions(mcp_env) -> None:
         "wait_for_payment",
         "provider_health",
         "list_recent_payments",
+        # An outside agent can consult the resident one rather than reasoning
+        # about payment internals it has no evidence for.
+        "ask_ops",
+        "diagnose_payment",
     }
     # The docstrings are the agent's only documentation.
     assert all(t.description for t in tools)
