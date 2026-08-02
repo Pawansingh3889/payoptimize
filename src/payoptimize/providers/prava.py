@@ -338,9 +338,28 @@ def poll_payment(
 
 # --- the adapter -------------------------------------------------------------
 
-MERCHANT_NAME = "PayOptimize"
-MERCHANT_URL = "https://payoptimize.fly.dev"
-MERCHANT_COUNTRY = "US"
+# PayOptimize is the orchestrator, not the merchant — the merchant is whoever's
+# payment this is. Hardcoding our own URL was wrong on that ground alone, and it
+# is also the leading explanation for "Visa 400 — Fetching cryptogram failed":
+# Visa Intelligent Commerce issues a cryptogram scoped to a merchant, and
+# `payoptimize.fly.dev` is not one in its network. The sessions that succeeded on
+# this account were minted against real commerce domains.
+#
+# Configurable per deployment until merchant identity lives on the tenant record,
+# which is where it actually belongs.
+DEFAULT_MERCHANT_NAME = "PayOptimize"
+DEFAULT_MERCHANT_URL = "https://payoptimize.fly.dev"
+DEFAULT_MERCHANT_COUNTRY = "US"
+
+
+def configured_merchant() -> tuple[str, str, str]:
+    """Merchant identity for the session, overridable by environment."""
+    _load_env()
+    return (
+        os.environ.get("PRAVA_MERCHANT_NAME", "").strip() or DEFAULT_MERCHANT_NAME,
+        os.environ.get("PRAVA_MERCHANT_URL", "").strip() or DEFAULT_MERCHANT_URL,
+        os.environ.get("PRAVA_MERCHANT_COUNTRY", "").strip() or DEFAULT_MERCHANT_COUNTRY,
+    )
 
 
 def configured_card_id() -> str:
@@ -365,9 +384,9 @@ class PravaProvider:
     # same questions and the fee column is not blank for the one real row.
     fee_bps: int = 0
     fee_fixed_cents: int = 0
-    merchant_name: str = MERCHANT_NAME
-    merchant_url: str = MERCHANT_URL
-    merchant_country: str = MERCHANT_COUNTRY
+    merchant_name: str = ""
+    merchant_url: str = ""
+    merchant_country: str = ""
     # PRAVA_CARD_ID, when set. Empty means "let Prava pick the default".
     card_id: str = ""
 
@@ -381,11 +400,12 @@ class PravaProvider:
             "price": amount_to_decimal(request.amount_cents),
             "currency": request.currency,
         }
+        name, url, country = configured_merchant()
         session = await run_in_threadpool(
             create_session,
-            self.merchant_name,
-            self.merchant_url,
-            self.merchant_country,
+            self.merchant_name or name,
+            self.merchant_url or url,
+            self.merchant_country or country,
             product,
             card_id=self.card_id or configured_card_id(),
             http=http,

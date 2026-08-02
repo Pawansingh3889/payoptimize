@@ -494,3 +494,46 @@ def test_the_adapter_passes_its_configured_card(monkeypatch: pytest.MonkeyPatch)
         asyncio.run(PravaProvider().charge(_charge(), http=http))
 
     assert seen["card"] == {"card_id": "card_from_env"}
+
+
+# --- merchant identity -------------------------------------------------------
+
+
+def test_merchant_identity_is_configurable(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Visa scopes an agentic credential to a merchant. Two live sandbox
+    transactions failed with "Visa 400 — Fetching cryptogram failed" while
+    minting against `payoptimize.fly.dev`, which is not a merchant in Visa's
+    network; the sessions that worked on this account used real commerce
+    domains. PayOptimize is the orchestrator, not the merchant."""
+    monkeypatch.setenv("PRAVA_MERCHANT_NAME", "Allbirds")
+    monkeypatch.setenv("PRAVA_MERCHANT_URL", "https://allbirds.com")
+    monkeypatch.setenv("PRAVA_MERCHANT_COUNTRY", "US")
+    seen: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.update(json.loads(request.content))
+        return httpx.Response(201, json=SESSION)
+
+    with _client(handler) as http:
+        asyncio.run(PravaProvider().charge(_charge(), http=http))
+
+    merchant = seen["purchase_context"][0]["merchant_details"]
+    assert merchant["name"] == "Allbirds"
+    assert merchant["url"] == "https://allbirds.com"
+
+
+def test_the_default_merchant_still_applies_when_unset(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    for var in ("PRAVA_MERCHANT_NAME", "PRAVA_MERCHANT_URL", "PRAVA_MERCHANT_COUNTRY"):
+        monkeypatch.delenv(var, raising=False)
+    seen: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.update(json.loads(request.content))
+        return httpx.Response(201, json=SESSION)
+
+    with _client(handler) as http:
+        asyncio.run(PravaProvider().charge(_charge(), http=http))
+
+    assert seen["purchase_context"][0]["merchant_details"]["name"] == "PayOptimize"
