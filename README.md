@@ -84,9 +84,53 @@ every uplift figure, and "measured" needs both 100 payments an arm *and* an inte
 excluding zero. A point estimate without an interval is a claim wearing a measurement's
 clothes.
 
-**Verification.** 322 tests. The suite makes a real socket impossible — both httpx
+**Verification.** 435 tests. The suite makes a real socket impossible — both httpx
 transports raise — so it can never spend one of a finite number of Prava sandbox
 transactions.
+
+## The ops agent
+
+An LLM sits inside the backend and does the work an on-call engineer would:
+diagnoses a failure from the evidence, explains a health transition, answers a
+merchant's question about their own payments, and proposes fixes. It is invoked
+on request (`POST /v1/agent/ask`, `/diagnose`), by an outside agent over MCP
+(`ask_ops`, `diagnose_payment`), and **unprompted** — a watcher narrates
+unrecognised decline codes, health changes, and abandoned payments into the
+dashboard's Incidents panel.
+
+It never sees anything private, and that is enforced rather than intended:
+
+- **A send-time denylist assert.** `llm.complete()` serializes the outgoing body,
+  scans it for tenant secrets, `pok_`/`sk` keys and card-like digit runs, and
+  **raises before the request leaves**. A redaction bug anywhere upstream fails
+  loudly instead of leaking quietly.
+- **Least privilege by construction.** A `ToolBox` is built with a `tenant_id`
+  and no tool schema exposes it, so a toolbox built for one merchant physically
+  cannot fetch another's payment — it is not a rule the model is asked to follow.
+- **Tenant identities are pseudonyms.** Names and emails become `tenant_<id>`
+  before they reach the model, restorable only for the caller's own tenant.
+- **Exactly one write path.** A test greps the package: the agent may mutate
+  payment state in one place, inside a guarded executor. If that ever fails,
+  something gave the model a second route to the database.
+
+**Autonomy splits by blast radius, not by a single switch.** Clearing an
+injection or nudging the generator rate is reversible in one call, so those
+execute immediately. Reconciling a payment writes a merchant's record of what
+happened to their money, so it is *always* proposed for a human — and no
+environment variable can promote it. `PAYOPTIMIZE_AGENT_AUTONOMY=propose` is a
+kill switch that downgrades everything and upgrades nothing.
+
+**An LLM problem is never a payments problem.** No key, a rate limit, a model
+outage, a bug in a tool — each costs a narrative and nothing else. There is a
+test asserting payments, routing, the dashboard and the fee ledger behave
+bit-identically with the agent dead.
+
+```bash
+OPENAI_API_KEY=sk-…                 # unset is a normal deployment; agent routes 503
+PAYOPTIMIZE_AGENT_MODEL=gpt-5       # default
+PAYOPTIMIZE_AGENT_TRIGGERS=0        # stop it narrating on its own
+PAYOPTIMIZE_AGENT_AUTONOMY=propose  # park every action for a human
+```
 
 ## Monetization
 
@@ -100,7 +144,7 @@ revenue recovered, so the pricing argument is a ratio you can read rather than a
 
 ```bash
 make setup    # uv sync + .env with a generated admin token
-make test     # 322 tests; no network, no sandbox transactions
+make test     # 435 tests; no network, no sandbox transactions
 make serve    # http://127.0.0.1:8080 — dashboard + API
 ```
 
