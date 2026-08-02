@@ -154,6 +154,13 @@ def agent_triggers_enabled() -> bool:
     return _str("PAYOPTIMIZE_AGENT_TRIGGERS") != "0"
 
 
+def agent_capture_enabled() -> bool:
+    """Whether runs store their full redacted transcript for the fine-tuning
+    corpus (docs/FINETUNE.md). Off by default: the audit tables always record
+    what happened; the transcript is training data and opt-in."""
+    return _str("PAYOPTIMIZE_AGENT_CAPTURE") == "1"
+
+
 def secret_values() -> tuple[str, ...]:
     """Every configured secret, for the redaction denylist."""
     return tuple(value for name in _SECRET_ENV_VARS if (value := _str(name)))
