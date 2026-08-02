@@ -24,6 +24,13 @@ def env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     monkeypatch.setenv("PAYOPTIMIZE_USER_EMAIL", "unit-test@example.invalid")
     monkeypatch.setenv("PAYOPTIMIZE_ADMIN_TOKEN", "test-admin")
     monkeypatch.setenv("PAYOPTIMIZE_SEED", "42")
+    # Same treatment as Prava: an unregistrable host behind the no-network
+    # guard, so a stray agent call can never spend real OpenAI credits.
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test-unit")
+    monkeypatch.setenv("OPENAI_API_BASE", "https://openai.invalid")
+    # Trigger tests drive watch_once() directly; the background watcher stays
+    # off so unrelated TestClient apps never race it.
+    monkeypatch.setenv("PAYOPTIMIZE_AGENT_TRIGGERS", "0")
     return db
 
 

@@ -18,7 +18,7 @@ from contextlib import contextmanager
 from typing import Any
 
 from . import config
-from .models import utc_now_iso
+from .models import iso_since, utc_now_iso
 
 # Matches the tenants table defaults; passed explicitly so the fee a tenant was
 # created with is visible in the code that creates it.
@@ -83,7 +83,33 @@ CREATE TABLE IF NOT EXISTS ledger (
   kind TEXT NOT NULL DEFAULT 'txn_fee',
   amount_cents INTEGER NOT NULL, currency TEXT NOT NULL, ts TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS agent_runs (
+  id INTEGER PRIMARY KEY,
+  tenant_id INTEGER NOT NULL DEFAULT 0,
+  trigger_kind TEXT NOT NULL,
+  question TEXT NOT NULL DEFAULT '',
+  answer TEXT NOT NULL DEFAULT '',
+  tools_used TEXT NOT NULL DEFAULT '',
+  model TEXT NOT NULL,
+  tokens_in INTEGER NOT NULL DEFAULT 0,
+  tokens_out INTEGER NOT NULL DEFAULT 0,
+  latency_ms INTEGER NOT NULL DEFAULT 0,
+  ts TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS agent_actions (
+  id INTEGER PRIMARY KEY,
+  run_id INTEGER NOT NULL REFERENCES agent_runs(id),
+  kind TEXT NOT NULL,
+  params TEXT NOT NULL,
+  rationale TEXT NOT NULL DEFAULT '',
+  detail TEXT NOT NULL DEFAULT '',
+  status TEXT NOT NULL DEFAULT 'proposed',
+  created_ts TEXT NOT NULL,
+  decided_ts TEXT NOT NULL DEFAULT ''
+);
 CREATE INDEX IF NOT EXISTS idx_payments_created ON payments(created_ts);
+CREATE INDEX IF NOT EXISTS idx_agent_runs_ts ON agent_runs(ts);
+CREATE INDEX IF NOT EXISTS idx_agent_actions_status ON agent_actions(status);
 CREATE INDEX IF NOT EXISTS idx_payments_tenant ON payments(tenant_id, created_ts);
 CREATE INDEX IF NOT EXISTS idx_attempts_payment ON attempts(payment_id);
 CREATE INDEX IF NOT EXISTS idx_attempts_provider_ts ON attempts(provider, created_ts);
@@ -787,3 +813,214 @@ def ledger_by_tenant(*, since: str, db_path: str | None = None) -> dict[int, int
             (since,),
         ).fetchall()
     return {int(row["tenant_id"]): int(row["fees"]) for row in rows}
+
+
+# --- ops agent ---------------------------------------------------------------
+#
+# Two tables, both append-mostly audit logs. agent_runs is every conversation
+# the resident LLM agent had (redacted text only — the redaction happens before
+# storage, so a leaked database cannot leak what the model never saw either).
+# agent_actions is every mutation it wanted, with the status transitions that
+# say whether a guard, a human, or an error had the last word.
+
+
+def list_tenants(*, db_path: str | None = None) -> list[dict[str, Any]]:
+    """Every tenant row. The redactor builds its pseudonym table from this —
+    it has to know every name and email that must never reach the model."""
+    with transaction(db_path) as conn:
+        return _rows(conn.execute("SELECT * FROM tenants ORDER BY id ASC"))
+
+
+def stranded_payments(
+    *, older_than_seconds: float = 900, db_path: str | None = None
+) -> list[dict[str, Any]]:
+    """Payments stuck in `pending` with nothing in flight to resolve them.
+
+    A healthy payment leaves `pending` inside its own request; one that is
+    still there after fifteen minutes with no pending attempt has been
+    abandoned by a crash or a startup failure, and nothing will ever come back
+    for it. This is what the agent's reconcile action is allowed to touch —
+    the query *is* the guard's definition of stranded.
+    """
+    cutoff = iso_since(older_than_seconds)
+    with transaction(db_path) as conn:
+        return _rows(
+            conn.execute(
+                "SELECT p.* FROM payments p WHERE p.status = 'pending'"
+                " AND p.created_ts < ? AND NOT EXISTS ("
+                "   SELECT 1 FROM attempts a"
+                "   WHERE a.payment_id = p.id AND a.status = 'pending'"
+                " ) ORDER BY p.created_ts ASC",
+                (cutoff,),
+            )
+        )
+
+
+def insert_agent_run(
+    *,
+    tenant_id: int,
+    trigger_kind: str,
+    question: str,
+    model: str,
+    db_path: str | None = None,
+) -> int:
+    """Open a run before the first model call, so a crash mid-run still leaves
+    an audit row saying the agent was invoked."""
+    with transaction(db_path) as conn:
+        cur = conn.execute(
+            "INSERT INTO agent_runs (tenant_id, trigger_kind, question, model, ts)"
+            " VALUES (?, ?, ?, ?, ?)",
+            (tenant_id, trigger_kind, question, model, utc_now_iso()),
+        )
+        assert cur.lastrowid is not None
+        return int(cur.lastrowid)
+
+
+def finish_agent_run(
+    run_id: int,
+    *,
+    answer: str,
+    tools_used: str,
+    tokens_in: int,
+    tokens_out: int,
+    latency_ms: int,
+    db_path: str | None = None,
+) -> None:
+    with transaction(db_path) as conn:
+        cur = conn.execute(
+            "UPDATE agent_runs SET answer = ?, tools_used = ?, tokens_in = ?,"
+            " tokens_out = ?, latency_ms = ? WHERE id = ?",
+            (answer, tools_used, tokens_in, tokens_out, latency_ms, run_id),
+        )
+        if cur.rowcount == 0:
+            raise NotFoundError(f"no agent run {run_id} to finish")
+
+
+def recent_agent_runs(
+    *,
+    tenant_id: int | None = None,
+    kinds: tuple[str, ...] | None = None,
+    limit: int = 20,
+    db_path: str | None = None,
+) -> list[dict[str, Any]]:
+    clauses: list[str] = []
+    params: list[Any] = []
+    if tenant_id is not None:
+        clauses.append("tenant_id = ?")
+        params.append(tenant_id)
+    if kinds:
+        clauses.append(f"trigger_kind IN ({','.join('?' * len(kinds))})")
+        params.extend(kinds)
+    where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+    params.append(limit)
+    with transaction(db_path) as conn:
+        return _rows(
+            conn.execute(
+                f"SELECT * FROM agent_runs{where} ORDER BY id DESC LIMIT ?",
+                params,
+            )
+        )
+
+
+def insert_agent_action(
+    *,
+    run_id: int,
+    kind: str,
+    params: str,
+    rationale: str,
+    status: str = "proposed",
+    detail: str = "",
+    db_path: str | None = None,
+) -> int:
+    now = utc_now_iso()
+    decided = now if status != "proposed" else ""
+    with transaction(db_path) as conn:
+        cur = conn.execute(
+            "INSERT INTO agent_actions (run_id, kind, params, rationale, detail,"
+            " status, created_ts, decided_ts) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (run_id, kind, params, rationale, detail, status, now, decided),
+        )
+        assert cur.lastrowid is not None
+        return int(cur.lastrowid)
+
+
+def get_agent_action(action_id: int, *, db_path: str | None = None) -> dict[str, Any] | None:
+    with transaction(db_path) as conn:
+        return _row(conn.execute("SELECT * FROM agent_actions WHERE id = ?", (action_id,)))
+
+
+def pending_agent_actions(*, db_path: str | None = None) -> list[dict[str, Any]]:
+    with transaction(db_path) as conn:
+        return _rows(
+            conn.execute("SELECT * FROM agent_actions WHERE status = 'proposed' ORDER BY id ASC")
+        )
+
+
+def recent_agent_actions(*, limit: int = 50, db_path: str | None = None) -> list[dict[str, Any]]:
+    with transaction(db_path) as conn:
+        return _rows(conn.execute("SELECT * FROM agent_actions ORDER BY id DESC LIMIT ?", (limit,)))
+
+
+def decide_agent_action(
+    action_id: int, *, status: str, detail: str = "", db_path: str | None = None
+) -> None:
+    """Move a proposal to approved/rejected — exactly once.
+
+    The `status = 'proposed'` clause is the whole exactly-once guarantee: two
+    concurrent approvals race on one UPDATE, and the loser's rowcount is 0.
+    """
+    with transaction(db_path) as conn:
+        cur = conn.execute(
+            "UPDATE agent_actions SET status = ?, detail = ?, decided_ts = ?"
+            " WHERE id = ? AND status = 'proposed'",
+            (status, detail, utc_now_iso(), action_id),
+        )
+        if cur.rowcount == 0:
+            raise NotFoundError(
+                f"no undecided agent action {action_id} — already decided or unknown"
+            )
+
+
+def mark_agent_action(
+    action_id: int, *, status: str, detail: str = "", db_path: str | None = None
+) -> None:
+    """Record how an approved action's execution went (executed | failed)."""
+    with transaction(db_path) as conn:
+        cur = conn.execute(
+            "UPDATE agent_actions SET status = ?, detail = ?, decided_ts = ? WHERE id = ?",
+            (status, detail, utc_now_iso(), action_id),
+        )
+        if cur.rowcount == 0:
+            raise NotFoundError(f"no agent action {action_id} to mark")
+
+
+def latest_attempt_id(*, db_path: str | None = None) -> int:
+    with transaction(db_path) as conn:
+        row = conn.execute("SELECT COALESCE(MAX(id), 0) AS n FROM attempts").fetchone()
+    return int(row["n"])
+
+
+def latest_provider_event_id(*, db_path: str | None = None) -> int:
+    with transaction(db_path) as conn:
+        row = conn.execute("SELECT COALESCE(MAX(id), 0) AS n FROM provider_events").fetchone()
+    return int(row["n"])
+
+
+def resolved_attempts_since(after_id: int, *, db_path: str | None = None) -> list[dict[str, Any]]:
+    """Resolved attempts newer than a high-water mark — the trigger watcher's
+    feed. By id, not timestamp: ids never collide inside one millisecond."""
+    with transaction(db_path) as conn:
+        return _rows(
+            conn.execute(
+                "SELECT * FROM attempts WHERE id > ?"
+                " AND status IN ('succeeded', 'failed') ORDER BY id ASC",
+                (after_id,),
+            )
+        )
+
+
+def provider_events_since(after_id: int, *, db_path: str | None = None) -> list[dict[str, Any]]:
+    with transaction(db_path) as conn:
+        return _rows(
+            conn.execute("SELECT * FROM provider_events WHERE id > ? ORDER BY id ASC", (after_id,))
+        )
