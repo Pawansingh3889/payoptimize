@@ -107,6 +107,12 @@ CREATE TABLE IF NOT EXISTS agent_actions (
   created_ts TEXT NOT NULL,
   decided_ts TEXT NOT NULL DEFAULT ''
 );
+CREATE TABLE IF NOT EXISTS agent_transcripts (
+  id INTEGER PRIMARY KEY,
+  run_id INTEGER NOT NULL REFERENCES agent_runs(id),
+  messages TEXT NOT NULL,
+  ts TEXT NOT NULL
+);
 CREATE INDEX IF NOT EXISTS idx_payments_created ON payments(created_ts);
 CREATE INDEX IF NOT EXISTS idx_agent_runs_ts ON agent_runs(ts);
 CREATE INDEX IF NOT EXISTS idx_agent_actions_status ON agent_actions(status);
@@ -992,6 +998,29 @@ def mark_agent_action(
         )
         if cur.rowcount == 0:
             raise NotFoundError(f"no agent action {action_id} to mark")
+
+
+def insert_agent_transcript(run_id: int, messages: str, *, db_path: str | None = None) -> int:
+    """The full (redacted) message array of one run, for the fine-tuning corpus.
+
+    Written only when PAYOPTIMIZE_AGENT_CAPTURE is on. Redaction happened
+    before any of this text existed, so the corpus physically cannot contain
+    what the model was never shown — see docs/FINETUNE.md.
+    """
+    with transaction(db_path) as conn:
+        cur = conn.execute(
+            "INSERT INTO agent_transcripts (run_id, messages, ts) VALUES (?, ?, ?)",
+            (run_id, messages, utc_now_iso()),
+        )
+        assert cur.lastrowid is not None
+        return int(cur.lastrowid)
+
+
+def agent_transcripts(*, limit: int = 1_000, db_path: str | None = None) -> list[dict[str, Any]]:
+    with transaction(db_path) as conn:
+        return _rows(
+            conn.execute("SELECT * FROM agent_transcripts ORDER BY id ASC LIMIT ?", (limit,))
+        )
 
 
 def latest_attempt_id(*, db_path: str | None = None) -> int:
