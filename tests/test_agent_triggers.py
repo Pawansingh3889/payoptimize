@@ -222,3 +222,26 @@ def test_the_loop_stops_when_cancelled(engine: Engine) -> None:
 
     asyncio.run(run())
     assert watcher.started  # it did sweep before dying
+
+
+def test_startup_convergence_is_not_an_incident(engine: Engine, db: str) -> None:
+    """On the first live run the agent narrated three rails going
+    `unknown → healthy` as traffic warmed up, burning two model calls to say
+    "no action needed". A rail with no opinion becoming healthy has not
+    recovered from anything."""
+    monitor = engine.health
+    monitor._last["stripe_sim"] = "unknown"
+    monitor._note("stripe_sim", "healthy")
+
+    events = store.recent_provider_events(since="2000-01-01T00:00:00.000+00:00", db_path=db)
+    assert [e for e in events if e["kind"].startswith("health_")] == []
+
+
+def test_a_real_recovery_is_still_an_incident(engine: Engine, db: str) -> None:
+    """The noise fix must not silence the transition that matters."""
+    monitor = engine.health
+    monitor._last["stripe_sim"] = "degraded"
+    monitor._note("stripe_sim", "healthy")
+
+    events = store.recent_provider_events(since="2000-01-01T00:00:00.000+00:00", db_path=db)
+    assert [e["kind"] for e in events] == ["health_recovered"]

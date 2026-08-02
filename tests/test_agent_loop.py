@@ -96,7 +96,13 @@ def test_a_dead_model_still_leaves_an_audit_row(engine: Engine, db: str) -> None
 
     run = store.recent_agent_runs(db_path=db)[0]
     assert run["question"] == "anything"
-    assert run["answer"] == ""
+    # Not blank: two runs on the first live sweep landed with an empty answer
+    # and no trace of the cause. "The agent was invoked and something went
+    # wrong" is not an audit trail — the reason is recorded, redacted like any
+    # other text, and the Incidents panel filters it so a failure is never
+    # rendered as an incident report.
+    assert run["answer"].startswith(loop.FAILED_PREFIX)
+    assert "500" in run["answer"]
 
 
 def test_capture_stores_the_redacted_transcript(

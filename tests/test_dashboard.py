@@ -552,3 +552,16 @@ def test_the_incidents_panel_is_on_the_page(client: TestClient) -> None:
     body = client.get("/").text
     assert 'id="incidents"' in body
     assert "{incidents}" not in body
+
+
+def test_a_failed_run_is_audited_but_not_shown_as_an_incident() -> None:
+    """It belongs in the audit trail, not on the wall."""
+    runs = [
+        {
+            "trigger_kind": "health_event",
+            "answer": "(agent run failed) OpenAI returned 500",
+            "ts": "2026-08-02T01:00:00.000+00:00",
+        }
+    ]
+    assert "has not written yet" in dashboard.render_incidents(runs)
+    assert "500" not in dashboard.render_incidents(runs)

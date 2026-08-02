@@ -74,6 +74,12 @@ proposed for human approval). If nothing is wrong, say so plainly.
 - Be concise: an operator reads your answer under time pressure."""
 
 
+# Marks a run that never produced an answer. Kept in the answer column so the
+# audit trail is complete without a schema change, and recognised by the
+# Incidents panel so a failure is never rendered as an incident report.
+FAILED_PREFIX = "(agent run failed)"
+
+
 def run(
     engine: Engine,
     question: str,
@@ -127,6 +133,14 @@ def run(
                 )
         else:
             answer = CAP_ANSWER
+    except Exception as exc:
+        # The run row already exists, and the `finally` below will write it
+        # whatever happens. Without this the row lands with a blank answer and
+        # no trace of the cause: two runs did exactly that on the first live
+        # sweep, and "the agent was invoked and something went wrong" is not an
+        # audit trail. The reason goes through the redactor like any other text.
+        answer = f"{FAILED_PREFIX} {exc}"
+        raise
     finally:
         # The answer is redacted a second time on the way to disk: it is model
         # output, and belt-and-braces is the house style at this boundary.

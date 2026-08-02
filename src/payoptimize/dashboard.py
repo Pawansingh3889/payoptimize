@@ -458,6 +458,11 @@ def render_page(**fragments: str) -> str:
     return _PAGE.format(style=STYLE, **fragments)
 
 
+# Mirrors agent.loop.FAILED_PREFIX. Imported lazily would be cleaner, but the
+# dashboard deliberately imports nothing from the agent package.
+AGENT_RUN_FAILED = "(agent run failed)"
+
+
 def render_incidents(runs: list[dict[str, Any]]) -> str:
     """What the agent noticed while nobody was watching.
 
@@ -480,7 +485,9 @@ def render_incidents(runs: list[dict[str, Any]]) -> str:
     for run in runs:
         label, tone = KINDS.get(str(run["trigger_kind"]), ("agent", "ink-3"))
         answer = str(run.get("answer") or "").strip()
-        if not answer:
+        # A run that failed is in the audit trail, not on the wall. It carries a
+        # marker rather than a blank so the reason survives for an operator.
+        if not answer or answer.startswith(AGENT_RUN_FAILED):
             continue
         cells.append(
             f'<div class="incident"><div class="imeta">'

@@ -163,6 +163,11 @@ class HealthMonitor:
         self._last[provider] = state
         if previous is None or previous == state or state == HealthState.UNKNOWN:
             return
+        if previous == HealthState.UNKNOWN:
+            # The first real reading after startup or a quiet spell. A rail going
+            # from "no opinion" to "healthy" has not recovered from anything, and
+            # narrating it buries the transition that matters under warm-up noise.
+            return
         if state == HealthState.HEALTHY:
             kind = "health_recovered"
         else:
