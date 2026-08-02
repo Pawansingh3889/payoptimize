@@ -27,6 +27,7 @@ from starlette.responses import HTMLResponse, JSONResponse
 from starlette.routing import Route
 
 from . import billing, config, dashboard, store, tenancy
+from .agent import actions as agent_actions
 from .engine import Engine, RailUnavailable, to_response
 from .generator import Generator
 from .models import (
@@ -548,6 +549,50 @@ async def admin_generator(request: Request) -> JSONResponse:
     )
 
 
+async def admin_agent_actions(request: Request) -> JSONResponse:
+    """What the agent has proposed and what became of it."""
+    _require_admin(request)
+    engine = _engine(request)
+    return JSONResponse(
+        {"actions": store.recent_agent_actions(limit=_limit(request), db_path=engine.db_path)}
+    )
+
+
+async def admin_decide_agent_action(request: Request) -> JSONResponse:
+    """A human's yes or no on one proposal.
+
+    Approving re-runs the guard against live state — the world moves between a
+    proposal and its approval, and an action that made sense an hour ago may not
+    now. Rejecting records the decision and runs nothing.
+    """
+    _require_admin(request)
+    engine = _engine(request)
+    body = await _json_body(request)
+    decision = str(body.get("decision", ""))
+    if decision not in ("approved", "rejected"):
+        raise HTTPException(status_code=422, detail="decision must be approved or rejected")
+
+    action_id = int(request.path_params["action_id"])
+    generator = getattr(request.app.state, "generator", None)
+    try:
+        if decision == "rejected":
+            store.decide_agent_action(
+                action_id,
+                status="rejected",
+                detail="rejected by operator",
+                db_path=engine.db_path,
+            )
+            return JSONResponse({"action_id": action_id, "status": "rejected"})
+        outcome = agent_actions.approve(engine, generator, action_id=action_id)
+    except store.NotFoundError as exc:
+        # Already decided, or never existed. Both are 404 — and this is the
+        # exactly-once guarantee surfacing, not a bug.
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except agent_actions.ActionRefused as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return JSONResponse({"action_id": action_id, **outcome})
+
+
 async def admin_state(request: Request) -> JSONResponse:
     """Posteriors per arm, so the learning is inspectable while an injection is
     in flight rather than only inferable from the traffic mix."""
@@ -618,6 +663,8 @@ ROUTES = [
     Route("/admin/outage", admin_outage, methods=["POST"]),
     Route("/admin/generator", admin_generator, methods=["POST"]),
     Route("/admin/state", admin_state),
+    Route("/admin/agent/actions", admin_agent_actions),
+    Route("/admin/agent/actions/{action_id:int}", admin_decide_agent_action, methods=["POST"]),
     Route("/", dashboard_page),
     Route("/fragments/{name}", fragment),
 ]

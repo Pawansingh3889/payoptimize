@@ -56,9 +56,7 @@ def test_a_scripted_conversation_lands_in_the_audit(engine: Engine, db: str) -> 
     )
 
     with stub.client() as http:
-        result = loop.run(
-            engine, f"why did {payment_id} fail?", tenant_id=tenant_id, http=http
-        )
+        result = loop.run(engine, f"why did {payment_id} fail?", tenant_id=tenant_id, http=http)
 
     # The model's mention of the tenant by name is redacted in the stored
     # answer and restored only for the tenant's own display.
