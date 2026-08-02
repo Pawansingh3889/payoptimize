@@ -186,6 +186,23 @@ class PayOptimizeClient:
                 return payment
             sleep(interval)
 
+    def ask_agent(self, question: str) -> dict[str, Any]:
+        """Ask the ops agent about this merchant's payments."""
+        result: dict[str, Any] = self._request("POST", "/v1/agent/ask", json={"question": question})
+        return result
+
+    def diagnose_payment(self, payment_id: str) -> dict[str, Any]:
+        """Why did this payment do what it did?"""
+        result: dict[str, Any] = self._request(
+            "POST", "/v1/agent/diagnose", json={"payment_id": payment_id}
+        )
+        return result
+
+    def agent_runs(self, limit: int = 10) -> list[dict[str, Any]]:
+        body = self._request("GET", "/v1/agent/runs", params={"limit": limit})
+        runs: list[dict[str, Any]] = body["runs"]
+        return runs
+
     def provider_health(self) -> list[dict[str, Any]]:
         body = self._request("GET", "/v1/providers", auth=False)
         providers: list[dict[str, Any]] = body["providers"]

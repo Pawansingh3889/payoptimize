@@ -128,6 +128,44 @@ def wait_for_payment(payment_id: str, timeout_s: float = 180) -> dict[str, Any]:
 
 
 @server.tool()
+def ask_ops(question: str) -> dict[str, Any]:
+    """Ask PayOptimize's resident ops agent a question about this account's payments.
+
+    It has read access to payments, attempts, provider health, corridor analytics
+    and the fee ledger, and answers from that evidence rather than from memory.
+    Use it for "why is my auth rate down", "what happened to payment X", "which
+    provider is failing" — anything needing several facts joined together.
+
+    It never sees another merchant's data, and it cannot change anything without
+    a human approving first.
+    """
+    with _client() as client:
+        result = client.ask_agent(question)
+    return {
+        "answer": result["answer"],
+        "evidence": result.get("evidence", []),
+        "actions": result.get("actions", []),
+    }
+
+
+@server.tool()
+def diagnose_payment(payment_id: str) -> dict[str, Any]:
+    """Explain what happened to one payment and what to do about it.
+
+    Returns a narrative plus the evidence it rests on. If the payment can be
+    remediated, the agent may propose an action — proposals wait for a human, so
+    tell the user what was proposed rather than reporting it as done.
+    """
+    with _client() as client:
+        result = client.diagnose_payment(payment_id)
+    return {
+        "answer": result["answer"],
+        "evidence": result.get("evidence", []),
+        "actions": result.get("actions", []),
+    }
+
+
+@server.tool()
 def provider_health() -> list[dict[str, Any]]:
     """Current state of every payment rail.
 

@@ -28,6 +28,8 @@ from starlette.routing import Route
 
 from . import billing, config, dashboard, store, tenancy
 from .agent import actions as agent_actions
+from .agent import loop as agent_loop
+from .agent.llm import AgentError
 from .engine import Engine, RailUnavailable, to_response
 from .generator import Generator
 from .models import (
@@ -130,6 +132,8 @@ async def index(request: Request) -> JSONResponse:
                 "GET /v1/payments": "recent payments for your tenant",
                 "GET /v1/analytics/summary": "auth rate, uplift, volume by provider and corridor",
                 "GET /v1/ledger": "your fee statement — what PayOptimize charged, and why",
+                "POST /v1/agent/ask": "ask the ops agent about your payments",
+                "POST /v1/agent/diagnose": "why did this payment do that?",
             },
         }
     )
@@ -330,6 +334,84 @@ async def analytics_summary(request: Request) -> JSONResponse:
             "by_mode": modes,
             "by_provider": providers,
             "by_corridor": sorted(corridors.values(), key=lambda c: c["segment"]),
+        }
+    )
+
+
+AGENT_MAX_QUESTION = 500
+
+
+def _agent_run(request: Request, question: str, *, trigger: str, tenant_id: int) -> JSONResponse:
+    """One agent conversation, wrapped so an LLM problem is never a payments
+    problem: the model is slow, rate-limited, or unconfigured, and the caller
+    gets a typed error while everything else in the service carries on."""
+    engine = _engine(request)
+    try:
+        result = agent_loop.run(
+            engine,
+            question,
+            tenant_id=tenant_id,
+            trigger=trigger,
+            generator=getattr(request.app.state, "generator", None),
+        )
+    except AgentError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    return JSONResponse(
+        {
+            "run_id": result["run_id"],
+            "answer": result["display_answer"],
+            "evidence": result["evidence"],
+            "actions": result["actions"],
+            "usage": result["usage"],
+        }
+    )
+
+
+async def agent_ask(request: Request) -> JSONResponse:
+    """Ask the ops agent about your own payments.
+
+    Tenant-scoped at the toolbox, so the agent answering you cannot read another
+    merchant's data even if the question asks it to.
+    """
+    tenant = _tenant(request)
+    body = await _json_body(request)
+    question = str(body.get("question", "")).strip()
+    if not question:
+        raise HTTPException(status_code=422, detail="question must not be empty")
+    if len(question) > AGENT_MAX_QUESTION:
+        raise HTTPException(
+            status_code=422, detail=f"question must be under {AGENT_MAX_QUESTION} characters"
+        )
+    return _agent_run(request, question, trigger="ask", tenant_id=int(tenant["id"]))
+
+
+async def agent_diagnose(request: Request) -> JSONResponse:
+    """Why did this payment do that? Scoped like GET /v1/payments/{id}: someone
+    else's payment is a 404, never a 403, so ids do not leak."""
+    tenant = _tenant(request)
+    body = await _json_body(request)
+    payment_id = str(body.get("payment_id", "")).strip()
+    engine = _engine(request)
+    row = store.get_payment(payment_id, db_path=engine.db_path)
+    if row is None or row["tenant_id"] != tenant["id"]:
+        raise HTTPException(status_code=404, detail="no such payment")
+    return _agent_run(
+        request,
+        f"Diagnose payment {payment_id}. What happened, why, and what should be done?",
+        trigger="diagnose",
+        tenant_id=int(tenant["id"]),
+    )
+
+
+async def agent_runs(request: Request) -> JSONResponse:
+    """This tenant's audit trail: every time the agent was invoked on its behalf."""
+    tenant = _tenant(request)
+    engine = _engine(request)
+    return JSONResponse(
+        {
+            "runs": store.recent_agent_runs(
+                tenant_id=int(tenant["id"]), limit=_limit(request), db_path=engine.db_path
+            )
         }
     )
 
@@ -660,6 +742,9 @@ ROUTES = [
     Route("/v1/analytics/summary", analytics_summary),
     Route("/v1/providers", providers_health),
     Route("/v1/ledger", ledger),
+    Route("/v1/agent/ask", agent_ask, methods=["POST"]),
+    Route("/v1/agent/diagnose", agent_diagnose, methods=["POST"]),
+    Route("/v1/agent/runs", agent_runs),
     Route("/admin/outage", admin_outage, methods=["POST"]),
     Route("/admin/generator", admin_generator, methods=["POST"]),
     Route("/admin/state", admin_state),
