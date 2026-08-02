@@ -29,6 +29,7 @@ from starlette.routing import Route
 from . import billing, config, dashboard, store, tenancy
 from .agent import actions as agent_actions
 from .agent import loop as agent_loop
+from .agent import triggers as agent_triggers
 from .agent.llm import AgentError
 from .engine import Engine, RailUnavailable, to_response
 from .generator import Generator
@@ -429,6 +430,7 @@ CHART_WINDOW_SECONDS = 15 * 60
 CHART_BUCKET_SECONDS = 30
 FEED_LIMIT = 18
 PINNED_REAL = 3
+INCIDENT_LIMIT = 5
 
 
 def _summary_for_dashboard(engine: Engine) -> dict[str, Any]:
@@ -541,6 +543,13 @@ FRAGMENTS = {
     "tiles": lambda e: dashboard.render_tiles(e.health.snapshot()),
     "corridors": _corridors,
     "tenants": _tenants,
+    "incidents": lambda e: dashboard.render_incidents(
+        store.recent_agent_runs(
+            kinds=("unknown_decline", "health_event", "stranded"),
+            limit=INCIDENT_LIMIT,
+            db_path=e.db_path,
+        )
+    ),
     "feed": lambda e: dashboard.render_feed(
         store.recent_payments_with_attempts(limit=FEED_LIMIT, db_path=e.db_path),
         # Real-rail rows are pinned rather than left to compete with generator
@@ -771,6 +780,7 @@ def create_app(
         app.state.replayed_attempts = replayed
         app.state.generator = None
         app.state.prava_poller = None
+        app.state.agent_watcher = None
         tasks: list[asyncio.Task[None]] = []
 
         # The poller runs whenever the rail is configured. An approved payment
@@ -780,6 +790,13 @@ def create_app(
             poller = PravaPoller(db_path=built.db_path)
             app.state.prava_poller = poller
             tasks.append(asyncio.create_task(poller.run()))
+
+        # The agent narrates; it never blocks. Started only when both the
+        # switch and a key are present, and cancelled with everything else.
+        if agent_triggers.enabled():
+            watcher = agent_triggers.TriggerWatcher(engine=built)
+            app.state.agent_watcher = watcher
+            tasks.append(asyncio.create_task(watcher.run()))
 
         if with_generator:
             demo_tenant = tenancy.ensure_demo_tenant(db_path=built.db_path)

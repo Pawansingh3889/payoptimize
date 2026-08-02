@@ -104,6 +104,12 @@ tr:last-child td { border-bottom: none; }
 tr.pinned td { background: color-mix(in srgb, var(--real) 9%, transparent); }
 tr.pinned td:first-child { box-shadow: inset 2px 0 0 var(--real); }
 .pincap { font-size: 11px; color: var(--ink-3); margin: 0 0 6px; }
+.incidents { display: grid; gap: 10px; }
+.incident { border: 1px solid var(--line); border-left: 3px solid var(--ink-3); border-radius: 8px; padding: 10px 12px; background: var(--surface); }
+.imeta { display: flex; gap: 10px; align-items: center; font-size: 11px; color: var(--ink-3); margin-bottom: 5px; font-variant-numeric: tabular-nums; }
+.ikind { text-transform: uppercase; letter-spacing: 0.06em; font-weight: 700; }
+.i-critical { color: var(--critical); } .i-serious { color: var(--serious); } .i-warn { color: var(--warn); }
+.itext { font-size: 13px; color: var(--ink-2); white-space: pre-wrap; }
 .two { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
 @media (max-width: 860px) { .two { grid-template-columns: 1fr; } }
 .strip { display: flex; flex-wrap: wrap; gap: 10px; }
@@ -138,13 +144,15 @@ _PAGE = """<!doctype html>
     <section class="card"><h2>By corridor</h2><div class="scroll" id="corridors">{corridors}</div></section>
     <section class="card"><h2>Merchants</h2><div id="tenants">{tenants}</div></section>
   </div>
+  <section class="card"><h2>Incidents &mdash; what the agent noticed</h2>
+    <div id="incidents">{incidents}</div></section>
   <section class="card"><h2>Recent transactions</h2>
     <div class="scroll" id="feed">{feed}</div></section>
 </main>
 <footer>Simulated rails are labeled SIMULATED everywhere they appear. Prava is a real
 sandbox integration and is labeled REAL. Auth rate and uplift cover card traffic only.</footer>
 <script>
-const F = ["stats", "authchart", "mixchart", "tiles", "corridors", "tenants", "feed"];
+const F = ["stats", "authchart", "mixchart", "tiles", "corridors", "tenants", "incidents", "feed"];
 async function poll() {{
   await Promise.all(F.map(async n => {{
     try {{ document.getElementById(n).innerHTML = await (await fetch("/fragments/" + n)).text(); }}
@@ -448,6 +456,41 @@ def _feed_row(payment: dict[str, Any], *, pinned: bool = False) -> str:
 
 def render_page(**fragments: str) -> str:
     return _PAGE.format(style=STYLE, **fragments)
+
+
+def render_incidents(runs: list[dict[str, Any]]) -> str:
+    """What the agent noticed while nobody was watching.
+
+    This is a public page, so it shows the narrative and nothing else: no tool
+    arguments, no payment ids beyond what the answer itself mentions, and
+    pseudonyms stay pseudonyms — the redaction that protected the model's input
+    is the same redaction protecting this output.
+    """
+    if not runs:
+        return (
+            '<p class="empty">No incidents. The agent writes here when it notices '
+            "an unrecognised decline, a health change, or a stranded payment.</p>"
+        )
+    KINDS = {
+        "unknown_decline": ("decline", "critical"),
+        "health_event": ("health", "serious"),
+        "stranded": ("stranded", "warn"),
+    }
+    cells = []
+    for run in runs:
+        label, tone = KINDS.get(str(run["trigger_kind"]), ("agent", "ink-3"))
+        answer = str(run.get("answer") or "").strip()
+        if not answer:
+            continue
+        cells.append(
+            f'<div class="incident"><div class="imeta">'
+            f'<span class="ikind i-{tone}">{_esc(label)}</span>'
+            f"<span>{_esc(str(run['ts'])[11:19])}</span></div>"
+            f'<div class="itext">{_esc(answer)}</div></div>'
+        )
+    if not cells:
+        return '<p class="empty">The agent has been invoked but has not written yet.</p>'
+    return f'<div class="incidents">{"".join(cells)}</div>'
 
 
 # --- panel 3: provider mix ---------------------------------------------------

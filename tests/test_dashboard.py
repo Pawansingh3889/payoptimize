@@ -500,3 +500,55 @@ def test_the_live_feed_pins_prava_rows(db: str) -> None:
 
     assert feed.count("badge real") == 1
     assert "Real rail" in feed
+
+
+# --- the incidents panel -----------------------------------------------------
+
+
+def test_incidents_panel_is_empty_before_the_agent_speaks(client: TestClient) -> None:
+    body = client.get("/fragments/incidents").text
+    assert "No incidents" in body
+
+
+def test_incidents_render_the_narrative(db: str) -> None:
+    runs = [
+        {
+            "trigger_kind": "unknown_decline",
+            "answer": "Visa refused to mint a cryptogram for tenant_3's card.",
+            "ts": "2026-08-02T01:20:11.000+00:00",
+        }
+    ]
+    html = dashboard.render_incidents(runs)
+
+    assert "cryptogram" in html
+    assert "decline" in html
+    assert "01:20:11" in html
+
+
+def test_a_run_with_no_answer_is_not_shown(db: str) -> None:
+    """A run that crashed before answering still leaves an audit row. It is not
+    an incident report."""
+    runs = [{"trigger_kind": "stranded", "answer": "", "ts": "2026-08-02T01:00:00.000+00:00"}]
+    assert "has not written yet" in dashboard.render_incidents(runs)
+
+
+def test_incidents_escape_model_output(db: str) -> None:
+    """The narrative is LLM-generated text on a public page. It is data."""
+    runs = [
+        {
+            "trigger_kind": "health_event",
+            "answer": "<img src=x onerror=alert(1)> and <script>alert(2)</script>",
+            "ts": "2026-08-02T01:00:00.000+00:00",
+        }
+    ]
+    html = dashboard.render_incidents(runs)
+
+    assert "<script>" not in html
+    assert "<img src=x" not in html
+    assert "&lt;script&gt;" in html
+
+
+def test_the_incidents_panel_is_on_the_page(client: TestClient) -> None:
+    body = client.get("/").text
+    assert 'id="incidents"' in body
+    assert "{incidents}" not in body
