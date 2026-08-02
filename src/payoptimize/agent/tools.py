@@ -100,6 +100,39 @@ def _clamp(limit: Any, default: int) -> int:
     return max(1, min(MAX_LIMIT, value))
 
 
+ACTION_SPECS: list[dict[str, Any]] = [
+    _spec(
+        "reconcile_payment",
+        "Resolve a payment abandoned in `pending` with nothing in flight to finish"
+        " it, marking it failed/rail_unavailable. This writes a merchant's record of"
+        " what happened to their money, so it is always proposed for a human to"
+        " approve — never executed directly. Explain your reasoning in `reason`.",
+        {
+            "payment_id": {"type": "string", "description": "the stranded payment"},
+            "reason": {"type": "string", "description": "why this one is stranded"},
+        },
+    ),
+    _spec(
+        "clear_injection",
+        "Clear a staged outage or degradation from a SIMULATED provider, returning it"
+        " to its normal corridor behaviour. The real rail cannot be cleared or faked.",
+        {
+            "provider": {"type": "string", "description": "e.g. stripe_sim"},
+            "reason": {"type": "string", "description": "why it should be cleared"},
+        },
+    ),
+    _spec(
+        "set_generator_rate",
+        "Change the synthetic traffic rate in transactions per second (0 < tps <= 5)."
+        " Affects only the demo traffic generator, never a merchant's payments.",
+        {
+            "tps": {"type": "number", "description": "transactions per second"},
+            "reason": {"type": "string", "description": "why this rate"},
+        },
+    ),
+]
+
+
 @dataclass
 class ToolBox:
     """One run's tools: engine + tenant scope + redactor, bound at construction."""
@@ -113,7 +146,7 @@ class ToolBox:
     actions_log: list[dict[str, Any]] = field(default_factory=list)
 
     def specs(self) -> list[dict[str, Any]]:
-        return list(READ_SPECS)
+        return list(READ_SPECS) + list(ACTION_SPECS)
 
     def dispatch(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         handler = getattr(self, f"_tool_{name}", None)
@@ -247,3 +280,40 @@ class ToolBox:
         return billing.statement(
             self.tenant_id, limit=_clamp(limit, 20), db_path=self.engine.db_path
         )
+
+    # --- actions -------------------------------------------------------------
+    #
+    # Each records an intention and hands it to actions.submit, which decides
+    # whether this kind may self-execute. The tool result tells the model what
+    # actually happened, so it can say so in its answer rather than claiming a
+    # fix that is still waiting for a human.
+
+    def _submit(self, kind: str, params: dict[str, Any], reason: str) -> dict[str, Any]:
+        from . import actions
+
+        try:
+            outcome = actions.submit(
+                self.engine,
+                self.generator,
+                run_id=self.run_id,
+                kind=kind,
+                params=params,
+                rationale=reason,
+            )
+        except actions.ActionRefused as exc:
+            return {"status": "refused", "detail": str(exc)}
+        self.actions_log.append({"kind": kind, "params": params, **outcome})
+        return outcome
+
+    def _tool_reconcile_payment(self, payment_id: str = "", reason: str = "") -> dict[str, Any]:
+        return self._submit(
+            "reconcile", {"payment_id": str(payment_id)}, reason or "stranded payment"
+        )
+
+    def _tool_clear_injection(self, provider: str = "", reason: str = "") -> dict[str, Any]:
+        return self._submit(
+            "clear_injection", {"provider": str(provider)}, reason or "injection no longer needed"
+        )
+
+    def _tool_set_generator_rate(self, tps: float = 0.0, reason: str = "") -> dict[str, Any]:
+        return self._submit("generator_rate", {"tps": tps}, reason or "rate adjustment")
